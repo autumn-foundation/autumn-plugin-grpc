@@ -1,0 +1,6 @@
+#!/bin/sh
+# Enable with: git config core.hooksPath .githooks
+set -e
+cargo fmt --all --check
+cargo clippy --all-targets --features tls -- -D warnings
+cargo test --features tls --quiet

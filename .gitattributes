@@ -1,0 +1,4 @@
+# Keep LF on every platform. tests/codegen.rs compares generated files
+# byte for byte, and the descriptor keeps proto source positions.
+* text=auto eol=lf
+*.bin binary

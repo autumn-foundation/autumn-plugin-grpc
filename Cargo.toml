@@ -1,0 +1,73 @@
+[package]
+name = "autumn-plugin-grpc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "Apache-2.0"
+description = "gRPC for Autumn: serve tonic services with health, reflection, metrics, graceful drain and layered configuration"
+repository = "https://github.com/autumn-foundation/autumn-plugin-grpc"
+readme = "README.md"
+keywords = ["grpc", "autumn", "tonic", "plugin", "protobuf"]
+categories = ["web-programming::http-server", "network-programming"]
+exclude = [".github/", "docs/"]
+
+[features]
+default = []
+# TLS and mTLS for the gRPC listener (rustls with the `ring` provider).
+tls = ["tonic/tls-ring"]
+
+[dependencies]
+# Core surface only. Cargo unifies features with the host app.
+autumn-web = { version = "0.7", default-features = false }
+axum = { version = "0.8", default-features = false }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+http-body = "1"
+pin-project-lite = "0.2"
+prost = "0.14"
+prost-types = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "net", "rt", "macros"] }
+tokio-util = "0.7"
+toml = "1.1"
+tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+tower = { version = "0.5", default-features = false }
+tracing = "0.1"
+
+[dev-dependencies]
+autumn-web = { version = "0.7", default-features = false }
+axum = "0.8"
+bytes = "1"
+h2 = "0.4"
+http = "1"
+proptest = "1"
+serde_json = "1"
+protox = "0.9"
+rcgen = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+module_name_repetitions = "allow"
