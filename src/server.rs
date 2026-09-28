@@ -17,12 +17,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, PollSemaphore, WaitForCancellationFutureOwned};
+use tokio_util::task::TaskTracker;
 use tonic::service::Routes;
 use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-use crate::config::GrpcConfig;
+use crate::config::{GrpcConfig, Listener};
 use crate::error::GrpcError;
 use crate::lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 use crate::metrics::Metrics;
@@ -35,12 +36,18 @@ pub struct Shared {
     /// Names reported by the health service (user services only).
     pub health_names: OnceLock<Vec<String>>,
     pub metrics: Arc<Metrics>,
+    /// The listener mode, set at start.
+    pub listener: OnceLock<Listener>,
+    /// Shared mode: the routes that the gate calls.
+    pub gate: OnceLock<crate::gate::Target>,
+    /// Shared mode: calls in flight through the gate.
+    pub calls: TaskTracker,
     grace_ms: AtomicU64,
     /// Ends the accept loop and starts tonic's graceful shutdown.
     stop: CancellationToken,
-    /// Closes every open connection. The drain uses it after the grace
-    /// period.
-    kill: CancellationToken,
+    /// Closes every open connection (dedicated) or call (shared). The
+    /// drain uses it after the grace period.
+    pub kill: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     stopped: watch::Sender<bool>,
 }
@@ -53,6 +60,9 @@ impl Shared {
             health: OnceLock::new(),
             health_names: OnceLock::new(),
             metrics: Arc::new(Metrics::new()),
+            listener: OnceLock::new(),
+            gate: OnceLock::new(),
+            calls: TaskTracker::new(),
             grace_ms: AtomicU64::new(GrpcConfig::default().shutdown_grace_ms),
             stop: CancellationToken::new(),
             kill: CancellationToken::new(),
@@ -98,18 +108,32 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(mut task) = task {
-            let grace = self.grace();
-            if tokio::time::timeout(grace, &mut task).await.is_err() {
-                tracing::warn!(
-                    grace_ms = grace.as_millis(),
-                    "gRPC calls still open after the grace period; closing connections"
-                );
-                self.kill.cancel();
-                if tokio::time::timeout(KILL_WAIT, &mut task).await.is_err() {
-                    task.abort();
-                }
+        let grace = self.grace();
+        if let Some(mut task) = task
+            && tokio::time::timeout(grace, &mut task).await.is_err()
+        {
+            tracing::warn!(
+                grace_ms = grace.as_millis(),
+                "gRPC calls still open after the grace period; closing connections"
+            );
+            self.kill.cancel();
+            if tokio::time::timeout(KILL_WAIT, &mut task).await.is_err() {
+                task.abort();
             }
+        }
+        // Shared mode: Autumn owns the connections. Wait for the calls, then
+        // end the ones that are still open.
+        self.calls.close();
+        if tokio::time::timeout(grace, self.calls.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                grace_ms = grace.as_millis(),
+                "gRPC calls still open after the grace period; ending them"
+            );
+            self.kill.cancel();
+            let _ = tokio::time::timeout(KILL_WAIT, self.calls.wait()).await;
         }
         let _ = self.lifecycle.apply(LifecycleEvent::Drained);
         self.mark_stopped();
@@ -276,6 +300,7 @@ pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, G
         .grace_ms
         .store(config.shutdown_grace_ms, Ordering::Release);
     let _ = shared.local_addr.set(local_addr);
+    let _ = shared.listener.set(Listener::Dedicated);
 
     let stop = shared.stop.clone();
     let exit = ExitGuard(shared.clone());
@@ -296,6 +321,39 @@ pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, G
         return Err(GrpcError::NotIdle(state));
     }
     Ok(local_addr)
+}
+
+/// Shared mode: no listener. Make the routes available to the gate, then
+/// go to `Serving`.
+pub async fn start_shared(shared: &Arc<Shared>, launch: Launch) -> Result<(), GrpcError> {
+    let Launch {
+        config,
+        routes,
+        health,
+        health_names,
+        ..
+    } = launch;
+    if shared.lifecycle.get() != Lifecycle::Idle {
+        return Err(GrpcError::NotIdle(shared.lifecycle.get()));
+    }
+    if let Some(reporter) = health {
+        let _ = shared.health.set(reporter);
+    }
+    let _ = shared.health_names.set(health_names);
+    shared.set_health(ServingStatus::Serving).await;
+    shared
+        .grace_ms
+        .store(config.shutdown_grace_ms, Ordering::Release);
+    let _ = shared.listener.set(Listener::Shared);
+    let _ = shared.gate.set(crate::gate::Target {
+        router: routes.into_axum_router(),
+        timeout: config.timeout(),
+    });
+    shared
+        .lifecycle
+        .apply(LifecycleEvent::Bound)
+        .map(|_| ())
+        .map_err(GrpcError::NotIdle)
 }
 
 /// Applies `ServerExited` when the server task ends, also on a panic.

@@ -22,5 +22,5 @@ middleware does not touch gRPC traffic.
 - Two ports: firewalls and service definitions need both.
 - gRPC gets its own HTTP/2 settings (keepalive, streams, connection age).
 - The plugin must do its own lifecycle, health and metrics.
-- A shared-port mode is a possible later option. It needs HTTP/2 in
-  Autumn and a way to skip HTTP middleware for gRPC routes.
+- ADR 0008 adds an optional shared-port mode. The dedicated listener
+  stays the default.

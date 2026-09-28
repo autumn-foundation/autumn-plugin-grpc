@@ -6,10 +6,10 @@ gRPC plugin for the Autumn web framework, built on tonic 0.14. One crate:
 ## Commands
 
 - Format: `cargo fmt --all` (CI: `--check`)
-- Lint: `cargo clippy --all-targets --features tls -- -D warnings`
+- Lint: `cargo clippy --all-targets --features tls,multiplex -- -D warnings`
   (pedantic + nursery are on in `Cargo.toml`). Also run it with no features.
-- Test: `cargo test` and `cargo test --features tls`
-- Coverage: `cargo llvm-cov --features tls --fail-under-lines 85`
+- Test: `cargo test` and `cargo test --features tls,multiplex`
+- Coverage: `cargo llvm-cov --features tls,multiplex --fail-under-lines 85`
 - Regenerate test code from `proto/echo.proto`:
   `UPDATE_GENERATED=1 cargo test --test codegen`
 - Example: `cargo run --example echo`
@@ -22,7 +22,8 @@ No `protoc` is necessary. `tests/codegen.rs` uses `protox`.
 See `docs/architecture.md`. `plugin.rs` (builder, `Plugin`, route
 assembly), `config.rs`, `server.rs` (listener, `GrpcHandle`, drain),
 `lifecycle.rs`, `metrics.rs`, `registry.rs` (`GrpcServers`, the one
-metrics source), `health.rs`, `tls.rs`, `error.rs`.
+metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
+`tls.rs`, `error.rs`.
 
 ## Rules
 
@@ -31,6 +32,8 @@ metrics source), `health.rs`, `tls.rs`, `error.rs`.
 - **User layers wrap user services only.** Add plugin services after the
   user layers in `build_routes`. Auth goes through `guard*`, so
   `autumn routes` shows the service as gated.
+- **Shared mode dispatches HTTP/2 `application/grpc*` only.** Other
+  requests must reach Autumn's middleware (CSRF). Tests: `tests/shared.rs`.
 - **Set every hyper limit explicitly.** tonic passes `None`, and `None`
   removes the hyper default (ADR 0006).
 - **Shutdown work runs in the drain task**, not in the caller. Autumn can

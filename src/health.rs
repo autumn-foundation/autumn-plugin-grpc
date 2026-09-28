@@ -20,6 +20,9 @@ impl HealthIndicator for GrpcHealthIndicator {
             let state = self.shared.lifecycle.get();
             let mut details = HashMap::new();
             details.insert("state".to_owned(), serde_json::json!(state.as_str()));
+            if let Some(listener) = self.shared.listener.get() {
+                details.insert("listener".to_owned(), serde_json::json!(listener.as_str()));
+            }
             if let Some(addr) = self.shared.local_addr.get() {
                 details.insert("address".to_owned(), serde_json::json!(addr.to_string()));
             }

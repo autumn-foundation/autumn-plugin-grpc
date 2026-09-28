@@ -16,3 +16,5 @@
   requests for health and reflection. Loopback bind in `dev`/`test`.
 - Health follows Autumn readiness. The drain runs in its own task.
 - `tls` feature: TLS and mTLS from PEM files.
+- `multiplex` feature and `listener = "shared"`: serve gRPC on Autumn's
+  HTTP port (ADR 0008).

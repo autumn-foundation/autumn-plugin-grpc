@@ -32,6 +32,9 @@ pub enum GrpcError {
     /// The server is not in `Idle`: a shutdown came before or during start.
     #[error("the gRPC server cannot start in state `{0}`")]
     NotIdle(crate::lifecycle::Lifecycle),
+    /// Shared mode cannot run in this app.
+    #[error("gRPC shared listener: {0}")]
+    Shared(String),
     /// The startup hook ran twice.
     #[error("the gRPC server is already started")]
     AlreadyStarted,

@@ -105,6 +105,36 @@ impl<'de> Deserialize<'de> for Toggle {
     }
 }
 
+/// Where the gRPC server listens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Listener {
+    /// A listener of its own, on `bind` (ADR 0002).
+    #[default]
+    Dedicated,
+    /// Autumn's HTTP port. HTTP/2 requests with a gRPC content type go to
+    /// the gRPC services. Needs the `multiplex` feature (ADR 0008).
+    Shared,
+}
+
+impl Listener {
+    /// The name in TOML.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dedicated => "dedicated",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+impl fmt::Display for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Settings for one gRPC server.
 ///
 /// The defaults limit resource use. For a setting that says "`0`: off",
@@ -116,6 +146,9 @@ impl<'de> Deserialize<'de> for Toggle {
 pub struct GrpcConfig {
     /// Start the server. Default: `true`.
     pub enabled: bool,
+    /// `dedicated`: a listener of its own, on `bind`. `shared`: Autumn's
+    /// HTTP port (needs the `multiplex` feature). Default: `dedicated`.
+    pub listener: Listener,
     /// Listen address, `IP:port`. Port `0` picks a free port. Empty: the
     /// profile decides. `dev` and `test` use `127.0.0.1:50051`. Other
     /// profiles use `0.0.0.0:50051`. Default: empty.
@@ -211,6 +244,7 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            listener: Listener::Dedicated,
             bind: String::new(),
             health: true,
             reflection: Toggle::Auto,
@@ -480,7 +514,72 @@ impl GrpcConfig {
                 "`tls.client_auth_optional` needs `tls.client_ca_path`".to_owned(),
             ));
         }
+        if self.listener == Listener::Shared {
+            if has(&tls.cert_path) || has(&tls.client_ca_path) {
+                return Err(ConfigError(
+                    "`tls` has no effect with `listener = \"shared\"`; set TLS in `[server.tls]`"
+                        .to_owned(),
+                ));
+            }
+            if !cfg!(feature = "multiplex") {
+                return Err(ConfigError(
+                    "`listener = \"shared\"` needs the `multiplex` feature of autumn-plugin-grpc"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Settings of the dedicated listener that are not at their defaults.
+    /// They have no effect with `listener = "shared"`.
+    #[must_use]
+    pub fn dedicated_only_settings(&self) -> Vec<&'static str> {
+        let base = Self::default();
+        [
+            ("bind", self.bind.trim() != base.bind),
+            (
+                "max_connections",
+                self.max_connections != base.max_connections,
+            ),
+            (
+                "concurrency_limit_per_connection",
+                self.concurrency_limit_per_connection != base.concurrency_limit_per_connection,
+            ),
+            (
+                "max_concurrent_streams",
+                self.max_concurrent_streams != base.max_concurrent_streams,
+            ),
+            (
+                "http2_max_local_error_reset_streams",
+                self.http2_max_local_error_reset_streams
+                    != base.http2_max_local_error_reset_streams,
+            ),
+            ("tcp_nodelay", self.tcp_nodelay != base.tcp_nodelay),
+            (
+                "tcp_keepalive_ms",
+                self.tcp_keepalive_ms != base.tcp_keepalive_ms,
+            ),
+            (
+                "http2_keepalive_interval_ms",
+                self.http2_keepalive_interval_ms != base.http2_keepalive_interval_ms,
+            ),
+            (
+                "http2_keepalive_timeout_ms",
+                self.http2_keepalive_timeout_ms != base.http2_keepalive_timeout_ms,
+            ),
+            (
+                "max_connection_age_ms",
+                self.max_connection_age_ms != base.max_connection_age_ms,
+            ),
+            (
+                "tls.handshake_timeout_ms",
+                self.tls.handshake_timeout_ms != base.tls.handshake_timeout_ms,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, changed)| changed.then_some(key))
+        .collect()
     }
 }
 

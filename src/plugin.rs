@@ -15,8 +15,9 @@ use tonic::server::NamedService;
 use tonic::service::Routes;
 use tower::{Layer, Service};
 
-use crate::config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved};
+use crate::config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved};
 use crate::error::GrpcError;
+use crate::gate::{GrpcGate, SharedOwner};
 use crate::health::GrpcHealthIndicator;
 use crate::lifecycle::LifecycleEvent;
 use crate::metrics::MetricsLayer;
@@ -56,7 +57,8 @@ struct Pending {
     descriptors: Vec<&'static [u8]>,
 }
 
-/// Serves tonic services from an Autumn app, on a dedicated HTTP/2 listener.
+/// Serves tonic services from an Autumn app, on a dedicated HTTP/2 listener
+/// or on Autumn's HTTP port (`listener = "shared"`).
 ///
 /// ```rust,ignore
 /// use autumn_plugin_grpc::GrpcPlugin;
@@ -261,7 +263,7 @@ impl GrpcPlugin {
 
     /// The gRPC services as `autumn routes` lists them. The method is
     /// `GRPC` and the path is `/<service>/*`. These routes are on the gRPC
-    /// listener, not on the HTTP port.
+    /// listener, or on the HTTP port in shared mode.
     #[must_use]
     pub fn route_infos(&self) -> Vec<RouteInfo> {
         let Ok(resolved) = self.resolved() else {
@@ -542,21 +544,25 @@ impl Plugin for GrpcPlugin {
         let shared = self.shared.clone();
 
         if let Some(error) = problem {
-            // Fail at startup, where Autumn reports hook errors.
-            return app.on_startup(move |_state| {
-                let error = error.clone();
-                let shared = shared.clone();
-                async move {
-                    let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
-                    shared.mark_stopped();
-                    Err(startup_error(&GrpcError::Config(error)))
-                }
-            });
+            return fail_at_startup(app, shared, &GrpcError::Config(error));
         }
         if !config.enabled {
             tracing::info!(section = %self.section, "gRPC server disabled by configuration");
             return app;
         }
+        let app = if config.listener == Listener::Shared {
+            if let Some(owner) = app.extension::<SharedOwner>() {
+                let error = GrpcError::Shared(format!(
+                    "only one gRPC plugin can use `listener = \"shared\"`; `[{}]` uses it already",
+                    owner.0
+                ));
+                return fail_at_startup(app, shared, &error);
+            }
+            app.with_extension(SharedOwner(self.section.clone()))
+                .static_gate(GrpcGate::new(shared.clone()))
+        } else {
+            app
+        };
 
         let pending = Arc::new(Mutex::new(Some(Pending {
             registrations: std::mem::take(&mut self.registrations),
@@ -596,8 +602,8 @@ impl Plugin for GrpcPlugin {
                     None => Err(GrpcError::AlreadyStarted),
                 };
                 match result {
-                    Ok(addr) => {
-                        tracing::info!(%addr, services = ?user_names, "gRPC server listening");
+                    Ok(listening) => {
+                        tracing::info!(%listening, services = ?user_names, "gRPC server listening");
                         state.insert_extension(servers);
                         if is_default {
                             state.insert_extension(GrpcHandle::new(shared));
@@ -628,6 +634,22 @@ impl Plugin for GrpcPlugin {
                 async move { handle.shutdown().await }
             })
     }
+}
+
+/// Fail at startup, where Autumn reports hook errors.
+fn fail_at_startup(app: AppBuilder, shared: Arc<Shared>, error: &GrpcError) -> AppBuilder {
+    let message = error.to_string();
+    app.on_startup(move |_state| {
+        let shared = shared.clone();
+        let message = message.clone();
+        async move {
+            let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
+            shared.mark_stopped();
+            Err(autumn_web::AutumnError::internal_server_error_msg(format!(
+                "{PLUGIN_NAME}: {message}"
+            )))
+        }
+    })
 }
 
 /// Autumn runs plugin shutdown hooks after the HTTP drain, inside
@@ -666,7 +688,99 @@ fn warn_on_open_reflection(config: &GrpcConfig, development: bool) {
     }
 }
 
+/// Where the server listens, for the startup log.
+enum Listening {
+    Dedicated(std::net::SocketAddr),
+    Shared,
+}
+
+impl std::fmt::Display for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dedicated(addr) => write!(f, "{addr}"),
+            Self::Shared => f.write_str("Autumn's HTTP port (shared)"),
+        }
+    }
+}
+
 async fn launch(
+    state: &AppState,
+    pending: Pending,
+    config: GrpcConfig,
+    development: bool,
+    shared: &Arc<Shared>,
+    user_names: &[&'static str],
+) -> Result<Listening, GrpcError> {
+    if config.listener == Listener::Shared {
+        launch_shared(state, pending, config, development, shared, user_names).await?;
+        return Ok(Listening::Shared);
+    }
+    launch_dedicated(state, pending, config, development, shared, user_names)
+        .await
+        .map(Listening::Dedicated)
+}
+
+/// Shared mode checks that need `AppState`.
+fn check_shared(state: &AppState, config: &GrpcConfig, development: bool) -> Result<(), GrpcError> {
+    let autumn = state.config_arc();
+    if autumn.server.tls.is_some() {
+        return Err(GrpcError::Shared(format!(
+            "Autumn TLS (`[server.tls]`) in autumn-web {SUPPORTED_AUTUMN_WEB} does not offer HTTP/2 (ALPN `h2`), \
+             so gRPC clients cannot connect; the fix is autumn-foundation/autumn#2321 (next Autumn release). \
+             Use `listener = \"dedicated\"`, or end TLS at a proxy"
+        )));
+    }
+    let ignored = config.dedicated_only_settings();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            settings = ?ignored,
+            "these gRPC settings have no effect with `listener = \"shared\"`; Autumn's server owns the port"
+        );
+    }
+    let open = autumn
+        .server
+        .host
+        .parse::<std::net::IpAddr>()
+        .map_or(true, |ip| !ip.is_loopback());
+    if open && config.reflection.resolve(development) {
+        tracing::warn!(
+            host = %autumn.server.host,
+            "gRPC reflection is on and Autumn's port is not on loopback; set `reflection = false` to hide the API"
+        );
+    }
+    Ok(())
+}
+
+async fn launch_shared(
+    state: &AppState,
+    pending: Pending,
+    mut config: GrpcConfig,
+    development: bool,
+    shared: &Arc<Shared>,
+    user_names: &[&'static str],
+) -> Result<(), GrpcError> {
+    check_shared(state, &config, development)?;
+    fit_grace_to_autumn(&mut config, state);
+    let (routes, health) = build_routes(state, pending, &config, development, shared, user_names)?;
+    let health_names = user_names.iter().map(|n| (*n).to_owned()).collect();
+    crate::server::start_shared(
+        shared,
+        Launch {
+            config,
+            development,
+            routes,
+            health,
+            health_names,
+            #[cfg(feature = "tls")]
+            tls: None,
+        },
+    )
+    .await?;
+    crate::server::watch_readiness(shared, state.clone());
+    Ok(())
+}
+
+async fn launch_dedicated(
     state: &AppState,
     pending: Pending,
     mut config: GrpcConfig,

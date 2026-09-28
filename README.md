@@ -3,7 +3,8 @@
 gRPC for [Autumn](https://autumn-web.app), built on [tonic](https://docs.rs/tonic) 0.14.
 
 Add one plugin. Autumn serves HTTP on its port. The plugin serves gRPC on
-a dedicated HTTP/2 port.
+a dedicated HTTP/2 port, or on Autumn's port (see
+[Share Autumn's port](#share-autumns-port)).
 
 ```rust
 use autumn_plugin_grpc::GrpcPlugin;
@@ -28,6 +29,7 @@ async fn main() {
 | Feature | Default |
 |---|---|
 | Dedicated HTTP/2 listener | `127.0.0.1:50051` in `dev`/`test`, `0.0.0.0:50051` in other profiles |
+| Shared listener on Autumn's HTTP port | off; crate feature `multiplex` |
 | Health service `grpc.health.v1.Health` | on |
 | Server reflection (v1 and v1alpha) | on in `dev`/`test`, off in other profiles |
 | `grpc` indicator in `/actuator/health` | on |
@@ -45,6 +47,8 @@ async fn main() {
 autumn-plugin-grpc = "0.1"
 # With TLS:
 # autumn-plugin-grpc = { version = "0.1", features = ["tls"] }
+# On Autumn's HTTP port:
+# autumn-plugin-grpc = { version = "0.1", features = ["multiplex"] }
 ```
 
 The crate re-exports `tonic`, `tonic_health` and `tonic_reflection`. Use
@@ -133,6 +137,7 @@ then `AUTUMN_GRPC__*` environment variables. These stop boot:
 ```toml
 [grpc]
 enabled = true
+listener = "dedicated"                  # "dedicated" or "shared" (feature `multiplex`)
 bind = ""                               # IP:port; empty: the profile decides
 health = true
 reflection = "auto"                     # true, false or "auto"
@@ -193,6 +198,47 @@ Use a second section. The environment prefix changes with the section.
 - `AppState` has a `GrpcServers` value. `GrpcServers::get(section)` gives
   the handle of each server. `AppState` has a `GrpcHandle` only for the
   `grpc` section.
+
+## Share Autumn's port
+
+With the `multiplex` feature, gRPC can use Autumn's HTTP port:
+
+```toml
+[grpc]
+listener = "shared"
+```
+
+- The plugin binds no port. `GrpcHandle::local_addr()` is `None`.
+- HTTP/2 requests with a gRPC content type go to the gRPC services,
+  before Autumn's HTTP middleware. CSRF, sessions, the request timeout,
+  body limits and error pages do not apply to them.
+- All other requests go to Autumn as before. This includes HTTP/1.1 and
+  `application/grpc-web` requests.
+- Health, reflection, metrics, guards, `AppState`, `timeout_ms` and
+  `grpc-timeout` work as with a dedicated listener.
+- The feature turns on HTTP/2 (h2c) in axum for the whole app.
+- Autumn's server owns the connections. These settings have no effect,
+  and the plugin logs a warning when you change them: `bind`,
+  `max_connections`, `concurrency_limit_per_connection`,
+  `max_concurrent_streams`, `http2_max_local_error_reset_streams`,
+  `tcp_nodelay`, `tcp_keepalive_ms`, `http2_keepalive_*`,
+  `max_connection_age_ms` and `tls.handshake_timeout_ms`. hyper's defaults
+  apply (200 streams, 1024 local resets).
+- Only one plugin in an app can use shared mode.
+
+These stop boot:
+
+- `listener = "shared"` without the `multiplex` feature,
+- `[grpc.tls]` in shared mode (use `[server.tls]`),
+- `[server.tls]` on autumn-web 0.7. Its TLS listener does not offer
+  HTTP/2 (ALPN `h2`). autumn-foundation/autumn#2321 fixes this in the next
+  Autumn release. Until then, end TLS at a proxy or use a dedicated
+  listener.
+
+At shutdown, Autumn drains HTTP and gRPC calls together. Then the plugin
+answers new calls with `UNAVAILABLE`, waits for open calls up to the
+grace period, and ends the calls that are still open. See
+[ADR 0008](docs/adr/0008-shared-listener.md).
 
 ## Security
 
@@ -287,6 +333,7 @@ grpcurl -plaintext -H 'authorization: Bearer demo' \
 
 - [Architecture](docs/architecture.md)
 - [Plan and acceptance criteria](docs/plan.md)
+- [Shared listener plan](docs/plan-shared-listener.md)
 - [Verification](docs/verification.md)
 - [Decisions](docs/adr/)
 
