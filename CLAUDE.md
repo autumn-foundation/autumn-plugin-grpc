@@ -34,7 +34,9 @@ metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
   `autumn routes` shows the service as gated.
 - **Shared mode dispatches HTTP/2 `application/grpc*` only.** Other
   requests must reach Autumn's middleware (CSRF). Tests: `tests/shared.rs`.
-- **Set every hyper limit explicitly.** tonic passes `None`, and `None`
+- **Shared mode drains on Autumn's shutdown signal**, not only in the
+  hook. Autumn waits for all streams before hooks run (ADR 0008).
+- **Set every hyper limit explicitly** on the dedicated listener. tonic passes `None`, and `None`
   removes the hyper default (ADR 0006).
 - **Shutdown work runs in the drain task**, not in the caller. Autumn can
   drop the hook future (ADR 0007).

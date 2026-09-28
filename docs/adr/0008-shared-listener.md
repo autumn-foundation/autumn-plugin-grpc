@@ -35,7 +35,13 @@ Add `listener = "shared"`. The default stays `dedicated`.
   `TcpConnectInfo`.
 - The gate counts calls. Before `Serving` and after the drain starts, it
   answers `UNAVAILABLE`. After the grace period, it ends open response
-  bodies, and hyper resets their streams.
+  bodies with `UNAVAILABLE` trailers.
+- The drain starts when Autumn stops its listener
+  (`AppState::shutdown_token`, so `multiplex` turns on `autumn-web/ws`).
+  Autumn waits for all HTTP/2 streams before it runs shutdown hooks, and
+  its drain watchdog counts only HTTP requests. A drain that starts in the
+  hook would never run while a stream (for example a health `Watch`) is
+  open.
 - Only one plugin in an app can use shared mode.
 - Shared mode stops boot with `[server.tls]` on autumn-web 0.7, and with
   `[grpc.tls]`.
@@ -47,7 +53,12 @@ Add `listener = "shared"`. The default stays `dedicated`.
 - The plugin cannot set connection or HTTP/2 limits. Autumn's server owns
   them. The plugin logs one warning for such settings.
 - Autumn's HTTP drain waits for gRPC streams too, inside
-  `server.shutdown_timeout_secs`.
+  `server.shutdown_timeout_secs`. The plugin grace fits inside it.
+- hyper polls a body only while the client has flow-control window. A
+  client that stops reading keeps its stream until Autumn ends the
+  process.
+- Metrics count a call that the grace ends before its response head as
+  `CANCELLED`. The gate's own `UNAVAILABLE` answers are not counted.
 - Health, reflection, metrics, guards and `AppState` work as in the
   dedicated mode. `GrpcHandle::local_addr()` is `None`.
 - When Autumn releases ALPN `h2`, the TLS check can accept Autumn TLS.

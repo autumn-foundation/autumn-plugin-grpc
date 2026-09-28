@@ -16,8 +16,9 @@ default = []
 # TLS and mTLS for the gRPC listener (rustls with the `ring` provider).
 tls = ["tonic/tls-ring"]
 # Serve gRPC on Autumn's HTTP port (`listener = "shared"`). Turns on
-# HTTP/2 (h2c) in axum for the whole app.
-multiplex = ["axum/http2"]
+# HTTP/2 (h2c) in axum for the whole app. `autumn-web/ws` gives the
+# server shutdown signal (`AppState::shutdown_token`).
+multiplex = ["axum/http2", "autumn-web/ws"]
 
 [dependencies]
 # Core surface only. Cargo unifies features with the host app.

@@ -431,18 +431,20 @@ fn shared_mode_without_the_multiplex_feature_stops_boot() {
     assert!(error.message().contains("multiplex"), "{error}");
 
     let plugin = common::echo_plugin().configure(|c| c.listener = Listener::Shared);
-    assert!(plugin.effective_config().is_err());
-}
-
-#[test]
-fn dedicated_only_settings_names_the_changed_keys() {
-    assert!(GrpcConfig::default().dedicated_only_settings().is_empty());
-    let mut config = GrpcConfig::default();
-    config.bind = "127.0.0.1:0".to_owned();
-    config.max_connection_age_ms = 5;
-    config.timeout_ms = 5; // applies in both modes
-    assert_eq!(
-        config.dedicated_only_settings(),
-        ["bind", "max_connection_age_ms"]
-    );
+    let handle = plugin.handle();
+    let outcome = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
+        }))
+    })
+    .join()
+    .unwrap();
+    let message = outcome
+        .err()
+        .and_then(|panic| panic.downcast::<String>().ok())
+        .expect("boot must fail");
+    assert!(message.contains("multiplex"), "{message}");
+    assert_eq!(handle.state(), autumn_plugin_grpc::Lifecycle::Failed);
 }

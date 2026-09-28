@@ -52,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - run: cargo test --features tls
+      - run: cargo test --features multiplex
       - run: cargo test --features tls,multiplex
       - run: cargo doc --no-deps --features tls,multiplex
         env:

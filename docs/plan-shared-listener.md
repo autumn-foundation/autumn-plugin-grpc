@@ -48,7 +48,8 @@ How can this mode fail?
 | Two shared plugins: both serve `grpc.health.v1.Health` | A second shared plugin stops boot |
 | Listener settings (`bind`, `max_connections`) look active but are not | One warning that names them |
 | Calls before start or after stop reach no server | The gate answers `UNAVAILABLE` |
-| A shutdown waits for a stream that never ends | Grace period, then the gate ends the response body. hyper resets the stream |
+| A shutdown waits for a stream that never ends | Grace period, then the gate ends the response body with `UNAVAILABLE` |
+| Autumn's HTTP drain waits for gRPC streams before the shutdown hook runs, so the hook never runs (found in review) | Start the drain on Autumn's shutdown signal, not in the hook |
 | New calls during the drain | The gate answers `UNAVAILABLE` |
 | `grpc-timeout` is ignored, because tonic's transport does not run | The gate applies it |
 
@@ -86,7 +87,7 @@ How can this mode fail?
 | AC4 | gRPC calls skip Autumn HTTP middleware: a call succeeds with CSRF on, and a stream outlives `server.timeouts.request_timeout_ms`. |
 | AC5 | Other requests do not change: the same routes answer, and CSRF still applies. HTTP/1.1 requests with `application/grpc` stay on HTTP. `application/grpc-web` stays on HTTP. |
 | AC6 | Guards, `AppState`, metrics, health, reflection, `timeout_ms` (and `grpc-timeout`), the duplicate-service check, the route listing and `remote_addr()` work as in dedicated mode. |
-| AC7 | Lifecycle is `Serving` after start. At shutdown: health `NOT_SERVING`, new calls get `UNAVAILABLE`, in-flight calls finish within the grace, then the plugin ends them. A call before start gets `UNAVAILABLE`. |
+| AC7 | Lifecycle is `Serving` after start. Health follows Autumn readiness. When Autumn stops its listener, the drain starts: `Watch` streams see `NOT_SERVING` and end, new calls get `UNAVAILABLE`, in-flight calls finish within the grace, then the plugin ends them with `UNAVAILABLE`. Autumn's HTTP drain then ends. A call before start gets `UNAVAILABLE`. |
 | AC8 | Shared mode with `[server.tls]` stops boot on autumn-web 0.7, and the message names the Autumn fix. `[grpc.tls]` in shared mode stops boot. A second shared plugin stops boot. |
 | AC9 | Dedicated-listener settings that are not at their defaults log one warning in shared mode. |
 | AC10 | README section, ADR 0008, `docs/verification.md` rows, CI runs the `multiplex` feature. Quality gates pass. |

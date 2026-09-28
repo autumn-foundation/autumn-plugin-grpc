@@ -18,6 +18,7 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::test::TestApp;
 use bytes::Bytes;
 use common::{EchoClient, Prefix, pb};
+use prost::Message as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
@@ -27,10 +28,9 @@ use tonic_health::pb::health_client::HealthClient;
 
 /// The echo plugin in shared mode.
 fn shared_plugin() -> GrpcPlugin {
-    common::echo_plugin().configure(|c| {
-        c.listener = Listener::Shared;
-        c.bind = String::new();
-    })
+    common::echo_plugin()
+        .configure(|c| c.bind = String::new())
+        .listener(Listener::Shared)
 }
 
 /// HTTP routes: `GET /hello`, `POST /submit` (CSRF applies) and
@@ -123,6 +123,48 @@ async fn http2(
     response.map(|_| ())
 }
 
+/// One gRPC call over raw h2. Returns the `grpc-status` value.
+async fn raw_grpc(
+    addr: SocketAddr,
+    path: &str,
+    message: &[u8],
+    grpc_timeout: Option<&str>,
+) -> String {
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (client, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(connection);
+    let mut client = client.ready().await.unwrap();
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{addr}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    if let Some(value) = grpc_timeout {
+        request = request.header("grpc-timeout", value);
+    }
+    let (response, mut body) = client
+        .send_request(request.body(()).unwrap(), false)
+        .unwrap();
+    let mut frame = vec![0_u8];
+    frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(message);
+    body.send_data(Bytes::from(frame), true).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect("gRPC response in time")
+        .unwrap();
+    if let Some(code) = response.headers().get("grpc-status") {
+        return code.to_str().unwrap().to_owned();
+    }
+    let mut body = response.into_body();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    let trailers = body.trailers().await.unwrap().expect("trailers");
+    trailers["grpc-status"].to_str().unwrap().to_owned()
+}
+
 async fn say(client: &mut EchoClient<tonic::transport::Channel>, message: &str) -> String {
     client
         .say(pb::SayRequest {
@@ -200,24 +242,12 @@ async fn grpc_skips_csrf_and_the_request_timeout() {
         "the request timeout ends a slow HTTP request: {status}"
     );
 
-    // gRPC calls skip it: a POST without a CSRF token, and a stream that
-    // runs longer than the 200 ms request timeout.
+    // gRPC calls skip it: a POST without a CSRF token, and a unary call
+    // that takes 500 ms, longer than the 200 ms request timeout. (Autumn's
+    // timeout covers the response head, so a stream would not prove it.)
     let mut client = EchoClient::new(common::connect(addr).await);
     assert_eq!(say(&mut client, "no token").await, "no token");
-    let started = Instant::now();
-    let ticks: Vec<u32> = client
-        .ticks(pb::TicksRequest {
-            count: 5,
-            interval_ms: 100,
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .map(|tick| tick.unwrap().index)
-        .collect()
-        .await;
-    assert_eq!(ticks, [0, 1, 2, 3, 4]);
-    assert!(started.elapsed() > Duration::from_millis(400));
+    assert_eq!(say(&mut client, "slow").await, "slow");
     handle.shutdown().await;
 }
 
@@ -353,38 +383,37 @@ async fn guards_health_reflection_and_metrics_work() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_server_timeout_and_the_grpc_timeout_header_apply() {
+async fn the_server_timeout_applies() {
     let plugin = shared_plugin().configure(|c| c.timeout_ms = 100);
     let (addr, handle) = serve(TestApp::new(), plugin).await;
+    // The client sets no deadline, so only the server can end the call.
     let mut client = EchoClient::new(common::connect(addr).await);
-    let started = Instant::now();
     let status = client
         .say(pb::SayRequest {
             message: "slow".into(),
         })
         .await
         .unwrap_err();
-    assert!(
-        matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded),
-        "{status:?}"
-    );
-    assert!(started.elapsed() < Duration::from_millis(450));
+    assert_eq!(status.code(), Code::Cancelled, "{status:?}");
     handle.shutdown().await;
+}
 
-    // No server timeout: the client deadline (`grpc-timeout`) applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_grpc_timeout_header_applies() {
+    // A raw h2 call: tonic's client would enforce `grpc-timeout` itself.
     let (addr, handle) = serve(TestApp::new(), shared_plugin()).await;
-    let mut client = EchoClient::new(common::connect(addr).await);
-    let mut request = Request::new(pb::SayRequest {
-        message: "slow".into(),
-    });
-    request.set_timeout(Duration::from_millis(100));
-    let started = Instant::now();
-    let status = client.say(request).await.unwrap_err();
-    assert!(
-        matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded),
-        "{status:?}"
-    );
-    assert!(started.elapsed() < Duration::from_millis(450));
+    let slow = || {
+        pb::SayRequest {
+            message: "slow".into(),
+        }
+        .encode_to_vec()
+    };
+    let code = raw_grpc(addr, "/autumn.echo.v1.Echo/Say", &slow(), Some("100m")).await;
+    assert_eq!(code, "1", "CANCELLED by the header deadline");
+    let code = raw_grpc(addr, "/autumn.echo.v1.Echo/Say", &slow(), None).await;
+    assert_eq!(code, "0", "OK without a deadline");
+    let code = raw_grpc(addr, "/autumn.echo.v1.Echo/Say", &slow(), Some("bad")).await;
+    assert_eq!(code, "0", "a bad header is ignored");
     handle.shutdown().await;
 }
 
@@ -413,7 +442,7 @@ async fn shutdown_drains_in_flight_calls_and_refuses_new_ones() {
     let mut client = EchoClient::new(channel.clone());
     let mut stream = client
         .ticks(pb::TicksRequest {
-            count: 6,
+            count: 20,
             interval_ms: 50,
         })
         .await
@@ -444,8 +473,9 @@ async fn shutdown_drains_in_flight_calls_and_refuses_new_ones() {
         .unwrap_err();
     assert_eq!(health.code(), Code::Unavailable);
 
+    assert!(!shutdown.is_finished(), "the drain waits for the stream");
     let rest: Vec<u32> = stream.map(|t| t.unwrap().index).collect().await;
-    assert_eq!(rest, [1, 2, 3, 4, 5], "the in-flight stream completes");
+    assert_eq!(rest, (1..20).collect::<Vec<u32>>(), "the stream completes");
     tokio::time::timeout(Duration::from_secs(5), shutdown)
         .await
         .expect("the drain ends after the last call")
@@ -484,14 +514,18 @@ async fn the_grace_period_ends_calls_that_run_too_long() {
     assert_eq!(handle.state(), Lifecycle::Stopped);
     let ended = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(item) = stream.next().await {
-            if item.is_err() {
-                return true;
+            if let Err(status) = item {
+                return Some(status.code());
             }
         }
-        false
+        None
     })
     .await;
-    assert_eq!(ended, Ok(true), "the stream ends with an error");
+    assert_eq!(
+        ended,
+        Ok(Some(Code::Unavailable)),
+        "the stream ends with UNAVAILABLE, as in dedicated mode"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -500,7 +534,7 @@ async fn the_health_indicator_names_the_shared_listener() {
     let (addr, handle) = serve(app, shared_plugin()).await;
     let (status, text) = http1(
         addr,
-        "GET /actuator/health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        "GET /actuator/health HTTP/1.0\r\nhost: localhost\r\n\r\n",
     )
     .await;
     assert_eq!(status, 200, "{text}");
@@ -564,4 +598,126 @@ fn a_duplicate_service_stops_boot_in_shared_mode() {
     let plugin = shared_plugin().add_service(tonic_health::server::health_reporter().1);
     let message = boot_failure(TestApp::new(), plugin);
     assert!(message.contains("grpc.health.v1.Health"), "{message}");
+}
+
+/// Boot with `app`, keep the `AppState`, and serve as `App::run` does:
+/// the server stops on Autumn's shutdown signal and then waits for all
+/// connections.
+async fn serve_until_shutdown(
+    app: TestApp,
+    plugin: GrpcPlugin,
+) -> (
+    SocketAddr,
+    autumn_plugin_grpc::GrpcHandle,
+    AppState,
+    tokio::task::JoinHandle<()>,
+) {
+    let slot = Arc::new(Mutex::new(None));
+    let sink = slot.clone();
+    let handle = plugin.handle();
+    let client = app
+        .merge(http_routes())
+        .plugin(plugin)
+        .state_initializer(move |state| *sink.lock().unwrap() = Some(state.clone()))
+        .build();
+    let state: AppState = slot.lock().unwrap().clone().unwrap();
+    let router = client.into_router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = state.shutdown_token();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { stop.cancelled().await })
+        .await
+        .unwrap();
+    });
+    (addr, handle, state, server)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn autumn_shutdown_drains_grpc_so_the_http_drain_can_end() {
+    // Autumn waits for all connections before it runs shutdown hooks, and
+    // its watchdog does not count gRPC calls. The plugin must drain on
+    // Autumn's signal, not only in its hook.
+    let plugin = shared_plugin().configure(|c| c.shutdown_grace_ms = 300);
+    let (addr, handle, state, server) = serve_until_shutdown(TestApp::new(), plugin).await;
+    let channel = common::connect(addr).await;
+    let mut watch = HealthClient::new(channel.clone())
+        .watch(HealthCheckRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let first = watch.message().await.unwrap().unwrap();
+    assert_eq!(first.status(), ServingStatus::Serving);
+    let mut stream = EchoClient::new(channel)
+        .ticks(pb::TicksRequest {
+            count: 100_000,
+            interval_ms: 20,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    stream.next().await.unwrap().unwrap();
+
+    state.trigger_shutdown_for_test();
+
+    let saw_not_serving = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut seen = false;
+        while let Ok(Some(update)) = watch.message().await {
+            seen |= update.status() == ServingStatus::NotServing;
+        }
+        seen
+    })
+    .await;
+    assert_eq!(
+        saw_not_serving,
+        Ok(true),
+        "health Watch reports NOT_SERVING, then ends"
+    );
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the HTTP drain ends: the plugin ended the open stream")
+        .unwrap();
+    assert_eq!(handle.state(), Lifecycle::Stopped, "no shutdown hook ran");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_follows_autumn_readiness_in_shared_mode() {
+    let (addr, handle, state, _server) =
+        serve_until_shutdown(TestApp::new(), shared_plugin()).await;
+    let health = HealthClient::new(common::connect(addr).await);
+    let status = |mut health: HealthClient<tonic::transport::Channel>| async move {
+        health
+            .check(HealthCheckRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .status()
+    };
+    assert_eq!(status(health.clone()).await, ServingStatus::Serving);
+    state.probes().set_draining(true);
+    let down = health.clone();
+    assert!(
+        common::eventually(move || {
+            let down = down.clone();
+            async move { status(down).await == ServingStatus::NotServing }
+        })
+        .await,
+        "draining Autumn reports NOT_SERVING; calls still run"
+    );
+    state.probes().set_draining(false);
+    let up = health.clone();
+    assert!(
+        common::eventually(move || {
+            let up = up.clone();
+            async move { status(up).await == ServingStatus::Serving }
+        })
+        .await,
+        "readiness comes back"
+    );
+    handle.shutdown().await;
 }

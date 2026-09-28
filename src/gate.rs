@@ -24,6 +24,8 @@ use tower::{Layer, Service, ServiceExt as _};
 use crate::lifecycle::Lifecycle;
 use crate::server::Shared;
 
+const GRACE_EXPIRED: &str = "gRPC shutdown grace period expired";
+
 /// What the gate calls once the server starts.
 pub struct Target {
     /// The tonic routes, with the plugin layers.
@@ -75,6 +77,8 @@ where
     type Error = Infallible;
     type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
 
+    // A gRPC call leaves the inner readiness unused. That is safe: the
+    // next call polls it again, and Autumn's inner layers are always ready.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
         self.inner.poll_ready(cx)
     }
@@ -119,15 +123,8 @@ async fn dispatch(shared: Arc<Shared>, mut request: Request) -> Result<Response,
             )));
         }
     };
-    if let Some(ConnectInfo(peer)) = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .copied()
-    {
-        request.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer),
-        });
+    if let Some(info) = peer_info(&request) {
+        request.extensions_mut().insert(info);
     }
     let deadline = deadline(target.timeout, request.headers());
     let call = target.router.clone().oneshot(request);
@@ -137,12 +134,10 @@ async fn dispatch(shared: Arc<Shared>, mut request: Request) -> Result<Response,
             None => Some(call.await),
         }
     };
-    let kill = shared.kill.child_token();
+    let kill = shared.kill.clone();
     let response = tokio::select! {
         biased;
-        () = kill.cancelled() => return Ok(status(tonic::Status::unavailable(
-            "gRPC shutdown grace period expired",
-        ))),
+        () = kill.cancelled() => return Ok(status(tonic::Status::unavailable(GRACE_EXPIRED))),
         response = call => match response {
             Some(Ok(response)) => response,
             Some(Err(never)) => match never {},
@@ -154,9 +149,24 @@ async fn dispatch(shared: Arc<Shared>, mut request: Request) -> Result<Response,
         Body::new(Guarded {
             inner: body,
             kill: Box::pin(kill.cancelled_owned()),
+            done: false,
             _token: token,
         })
     }))
+}
+
+/// The TCP peer, for `request.remote_addr()`. On a Unix socket, Autumn
+/// sets `127.0.0.1:0` for every caller. That is not a real peer, so the
+/// plugin does not report it.
+fn peer_info(request: &Request) -> Option<TcpConnectInfo> {
+    let ConnectInfo(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>()?;
+    if peer.port() == 0 {
+        return None;
+    }
+    Some(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(*peer),
+    })
 }
 
 fn status(status: tonic::Status) -> Response {
@@ -199,11 +209,16 @@ pin_project_lite::pin_project! {
     /// A response body that the drain can see and end.
     ///
     /// - The token counts the call as in flight until the body is dropped.
-    /// - When `kill` fires, the body fails. hyper then resets the stream.
+    /// - When `kill` fires, the body ends with `UNAVAILABLE` trailers, as
+    ///   in dedicated mode. hyper polls the body only while the client has
+    ///   flow-control window. A client that stops reading keeps its stream
+    ///   until Autumn closes the connection.
     struct Guarded {
         #[pin]
         inner: Body,
         kill: Pin<Box<WaitForCancellationFutureOwned>>,
+        // The body sent its end (trailers or end of stream).
+        done: bool,
         _token: TaskTrackerToken,
     }
 }
@@ -217,16 +232,28 @@ impl http_body::Body for Guarded {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let this = self.project();
-        if this.kill.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Some(Err(axum::Error::new(
-                "gRPC shutdown grace period expired",
-            ))));
+        if *this.done {
+            return Poll::Ready(None);
         }
-        this.inner.poll_frame(cx)
+        if this.kill.as_mut().poll(cx).is_ready() {
+            *this.done = true;
+            let status = tonic::Status::unavailable(GRACE_EXPIRED);
+            let mut trailers = HeaderMap::new();
+            // `add_header` fails only for a bad message; ours is fixed.
+            let _ = status.add_header(&mut trailers);
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        let frame = this.inner.poll_frame(cx);
+        match &frame {
+            Poll::Ready(None) => *this.done = true,
+            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => *this.done = true,
+            _ => {}
+        }
+        frame
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.done || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -274,6 +301,20 @@ mod tests {
             Version::HTTP_11,
             Some("application/grpc")
         )));
+    }
+
+    #[test]
+    fn the_peer_is_the_tcp_peer_but_not_the_unix_socket_stamp() {
+        let mut with_peer = request(Version::HTTP_2, None);
+        let peer: SocketAddr = "10.1.2.3:4567".parse().unwrap();
+        with_peer.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(peer_info(&with_peer).unwrap().remote_addr, Some(peer));
+
+        let mut unix = request(Version::HTTP_2, None);
+        unix.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+        assert!(peer_info(&unix).is_none());
+        assert!(peer_info(&request(Version::HTTP_2, None)).is_none());
     }
 
     #[test]

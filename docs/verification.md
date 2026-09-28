@@ -1,8 +1,9 @@
 # Verification
 
-This file maps each acceptance criterion (AC) in [plan.md](plan.md) to its
-evidence. Test names are `file::test`. All tests run in CI on Linux,
-macOS and Windows, with and without the `tls` feature.
+This file maps each acceptance criterion (AC) in [plan.md](plan.md) and
+[plan-shared-listener.md](plan-shared-listener.md) to its evidence. Test
+names are `file::test`. All tests run in CI on Linux, macOS and Windows,
+with no features, with `tls`, with `multiplex` and with `tls,multiplex`.
 
 ## Acceptance criteria
 
@@ -28,13 +29,50 @@ macOS and Windows, with and without the `tls` feature.
 | Gate | Evidence |
 |---|---|
 | `cargo fmt` | CI job "Format"; `.githooks/pre-commit` |
-| clippy pedantic + nursery, `-D warnings` | CI jobs "Clippy ()" and "Clippy (tls)" |
+| clippy pedantic + nursery, `-D warnings` | CI jobs "Clippy ()", "Clippy (tls)", "Clippy (multiplex)", "Clippy (tls,multiplex)" |
 | No `unwrap`/`expect`/`panic!` in library code | `Cargo.toml` `[lints.clippy]` + `-D warnings`. Test modules allow them explicitly |
-| Line coverage ≥ 85 % | CI job "Coverage": `cargo llvm-cov --features tls --fail-under-lines 85`. Local result: about 95 % |
+| Line coverage ≥ 85 % | CI job "Coverage": `cargo llvm-cov --features tls,multiplex --fail-under-lines 85` |
 | MSRV 1.88 | CI job "MSRV (1.88)" |
 | Cross-platform | CI test matrix: Ubuntu, macOS, Windows |
-| Docs | `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/architecture.md` (Mermaid), `docs/adr/0001`–`0007`, `examples/echo.rs` |
+| Docs | `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/architecture.md` (Mermaid), `docs/adr/0001`–`0008`, `examples/echo.rs` |
 | Generated code is fresh | `codegen::generated_code_is_fresh` (`.gitattributes` keeps LF on Windows) |
+
+## Shared listener (issue #2)
+
+| AC | Criterion (short) | Evidence | Verdict |
+|---|---|---|---|
+| S1 | `listener` key, default `dedicated`, env override, bad value stops boot | `config::the_listener_defaults_to_dedicated`, `config::shared_mode_parses_from_files_and_env` | Met |
+| S2 | `multiplex` feature; shared mode without it stops boot | `config::shared_mode_without_the_multiplex_feature_stops_boot` (boots, checks the message and `Failed`) | Met |
+| S3 | No own port; h2c gRPC on Autumn's port; `local_addr()` is `None` | `shared::a_grpc_call_reaches_the_services_on_the_http_port` | Met |
+| S4 | gRPC skips HTTP middleware (CSRF, request timeout) | `shared::grpc_skips_csrf_and_the_request_timeout` (a 500 ms unary call with a 200 ms request timeout; the same timeout ends `/slow`) | Met |
+| S5 | HTTP routes do not change; HTTP/1.1 gRPC and grpc-web stay on HTTP | `shared::http_routes_answer_over_http1_and_http2`, `shared::grpc_over_http1_and_grpc_web_stay_on_http`, `gate::tests::only_http2_grpc_content_types_are_grpc` | Met |
+| S6 | Guards, `AppState`, metrics, health, reflection, timeouts, duplicate check, route listing, `remote_addr` | `shared::guards_health_reflection_and_metrics_work`, `shared::the_server_timeout_applies`, `shared::the_grpc_timeout_header_applies` (raw h2, so the client does not enforce it), `gate::tests::grpc_timeout_values_parse_as_in_the_spec`, `gate::tests::the_deadline_is_the_smaller_timeout`, `shared::remote_addr_is_the_peer_address`, `gate::tests::the_peer_is_the_tcp_peer_but_not_the_unix_socket_stamp`, `shared::a_duplicate_service_stops_boot_in_shared_mode`, `shared::the_health_indicator_names_the_shared_listener` | Met |
+| S7 | Lifecycle, readiness, drain, `UNAVAILABLE` for new and ended calls, call before start | `shared::autumn_shutdown_drains_grpc_so_the_http_drain_can_end`, `shared::health_follows_autumn_readiness_in_shared_mode`, `shared::shutdown_drains_in_flight_calls_and_refuses_new_ones`, `shared::the_grace_period_ends_calls_that_run_too_long`, `gate::tests::a_call_before_start_is_unavailable` | Met |
+| S8 | Boot errors: Autumn TLS on 0.7, `[grpc.tls]`, a second shared plugin | `shared::autumn_tls_stops_boot_in_shared_mode`, `config::grpc_tls_is_an_error_in_shared_mode`, `shared::a_second_shared_plugin_stops_boot`, `shared::a_dedicated_and_a_shared_plugin_run_side_by_side` | Met |
+| S9 | One warning for dedicated-only settings | `config::tests::dedicated_only_settings_names_each_changed_key` (all 11 keys), `plugin::tests::shared_mode_warns_once_for_ignored_settings`, `plugin::tests::shared_mode_warns_for_reflection_off_loopback` | Met (log output not read; see gaps) |
+| S10 | Docs, CI, quality gates | README "Share Autumn's port", ADR 0008, `docs/architecture.md`, CHANGELOG, CI matrix with `multiplex` | Met |
+
+Mutation checks: each change below made its test fail. The changes were:
+no HTTP/2 check, no deadline, `grpc-timeout` ignored, no body kill, a kill
+that resets the stream, no state check, and no drain on Autumn's shutdown
+signal.
+
+### Shared listener review
+
+| Angle | Finding | Result |
+|---|---|---|
+| Security, correctness | An open stream (for example a health `Watch`) keeps Autumn's HTTP drain open. Autumn runs the hook only after that drain, and its watchdog does not count gRPC. Shutdown hangs until SIGKILL | Fixed: the drain starts on `AppState::shutdown_token`. `shared::autumn_shutdown_drains_grpc_so_the_http_drain_can_end` |
+| Correctness | An ended stream got RST (`INTERNAL`), not `UNAVAILABLE` | Fixed: `UNAVAILABLE` trailers. `shared::the_grace_period_ends_calls_that_run_too_long` |
+| Security | A Unix socket gives `127.0.0.1:0` for every caller as `remote_addr` | Fixed: not reported. `gate::tests::the_peer_is_the_tcp_peer_but_not_the_unix_socket_stamp` |
+| Security | README did not list all skipped HTTP protections | Fixed |
+| Security | Reflection warning for `localhost` | Fixed. `plugin::tests::shared_mode_warns_for_reflection_off_loopback` |
+| Security | A client that stops reading cannot be ended | Documented (ADR 0008, gaps) |
+| Tests | The request-timeout proof used a stream; Autumn's timeout covers only the head | Fixed: a slow unary call |
+| Tests | tonic's client enforces `grpc-timeout` itself | Fixed: raw h2 call |
+| Tests | No readiness test, no proof that the drain waits, tight time bounds, JSON from a chunked body | Fixed |
+| API | `GrpcError::Shared(String)`; public `dedicated_only_settings`; no `listener()` setter; no `Hash` | Fixed: typed variants, `pub(crate)`, setter, `Hash` |
+| Correctness | `child_token()` per call | Fixed: `clone()` |
+| Correctness | Metrics count a call ended before its head as `CANCELLED`; gate refusals not counted | Documented (ADR 0008) |
 
 ## Manual run
 
@@ -91,5 +129,9 @@ has a fix and a test, or a reason.
   config tests check their values.
 - No Verus proof (ADR 0003).
 - No `plugin-contract` feature. It needs an Autumn release after 0.7.0.
-- gRPC-Web, compression switches and a shared-port mode are out of scope
-  for v0.1 (plan, blue hat).
+- gRPC-Web and compression switches are out of scope (plan, blue hat).
+- Shared mode: a client that stops reading a stream keeps it open until
+  Autumn ends the process (hyper polls a body only with flow-control
+  window). ADR 0008.
+- Shared mode: the AC9 warning text is unit-tested
+  (`plugin::tests::shared_mode_warns_*`). No test reads the log output.

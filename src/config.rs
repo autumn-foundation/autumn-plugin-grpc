@@ -106,7 +106,7 @@ impl<'de> Deserialize<'de> for Toggle {
 }
 
 /// Where the gRPC server listens.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Listener {
@@ -534,7 +534,7 @@ impl GrpcConfig {
     /// Settings of the dedicated listener that are not at their defaults.
     /// They have no effect with `listener = "shared"`.
     #[must_use]
-    pub fn dedicated_only_settings(&self) -> Vec<&'static str> {
+    pub(crate) fn dedicated_only_settings(&self) -> Vec<&'static str> {
         let base = Self::default();
         [
             ("bind", self.bind.trim() != base.bind),
@@ -776,5 +776,49 @@ fn deep_merge_at(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
         } else {
             base_table.insert(key, overlay_value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Setter = fn(&mut GrpcConfig);
+
+    #[test]
+    fn dedicated_only_settings_names_each_changed_key() {
+        assert!(GrpcConfig::default().dedicated_only_settings().is_empty());
+        let setters: [(&str, Setter); 11] = [
+            ("bind", |c| c.bind = "127.0.0.1:0".to_owned()),
+            ("max_connections", |c| c.max_connections = 1),
+            ("concurrency_limit_per_connection", |c| {
+                c.concurrency_limit_per_connection = 1;
+            }),
+            ("max_concurrent_streams", |c| c.max_concurrent_streams = 1),
+            ("http2_max_local_error_reset_streams", |c| {
+                c.http2_max_local_error_reset_streams = 1;
+            }),
+            ("tcp_nodelay", |c| c.tcp_nodelay = false),
+            ("tcp_keepalive_ms", |c| c.tcp_keepalive_ms = 1),
+            ("http2_keepalive_interval_ms", |c| {
+                c.http2_keepalive_interval_ms = 1;
+            }),
+            ("http2_keepalive_timeout_ms", |c| {
+                c.http2_keepalive_timeout_ms = 1;
+            }),
+            ("max_connection_age_ms", |c| c.max_connection_age_ms = 1),
+            ("tls.handshake_timeout_ms", |c| {
+                c.tls.handshake_timeout_ms = 1;
+            }),
+        ];
+        for (key, set) in setters {
+            let mut config = GrpcConfig::default();
+            set(&mut config);
+            assert_eq!(config.dedicated_only_settings(), [key]);
+        }
+        let mut config = GrpcConfig::default();
+        " ".clone_into(&mut config.bind);
+        config.timeout_ms = 5; // applies in both modes
+        assert!(config.dedicated_only_settings().is_empty(), "blank bind");
     }
 }

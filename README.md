@@ -210,12 +210,17 @@ listener = "shared"
 
 - The plugin binds no port. `GrpcHandle::local_addr()` is `None`.
 - HTTP/2 requests with a gRPC content type go to the gRPC services,
-  before Autumn's HTTP middleware. CSRF, sessions, the request timeout,
-  body limits and error pages do not apply to them.
+  before Autumn's HTTP middleware. No Autumn HTTP protection applies to
+  them: CSRF, sessions, the request timeout, body limits, rate limits,
+  load shedding, maintenance mode, trusted hosts, bot protection, CORS,
+  error pages and HTTP metrics. Use `guard` and `layer` for gRPC. tonic's
+  message size limits (4 MiB) still apply.
 - All other requests go to Autumn as before. This includes HTTP/1.1 and
   `application/grpc-web` requests.
 - Health, reflection, metrics, guards, `AppState`, `timeout_ms` and
   `grpc-timeout` work as with a dedicated listener.
+- `request.remote_addr()` gives the TCP peer. `local_addr()` is `None`.
+  On a Unix socket, `remote_addr()` is `None`.
 - The feature turns on HTTP/2 (h2c) in axum for the whole app.
 - Autumn's server owns the connections. These settings have no effect,
   and the plugin logs a warning when you change them: `bind`,
@@ -235,10 +240,18 @@ These stop boot:
   Autumn release. Until then, end TLS at a proxy or use a dedicated
   listener.
 
-At shutdown, Autumn drains HTTP and gRPC calls together. Then the plugin
-answers new calls with `UNAVAILABLE`, waits for open calls up to the
-grace period, and ends the calls that are still open. See
-[ADR 0008](docs/adr/0008-shared-listener.md).
+At shutdown:
+
+1. Autumn reports not ready. Health reports `NOT_SERVING`. Calls still
+   run during `server.prestop_grace_secs`.
+2. Autumn stops its listener. The plugin starts its drain at the same
+   time: health `Watch` streams end, new calls get `UNAVAILABLE`, and open
+   calls get the grace period.
+3. After the grace, the plugin ends open calls with `UNAVAILABLE`. Then
+   Autumn's HTTP drain can finish.
+
+A client that stops reading a stream can keep its connection open until
+Autumn's shutdown timeout. See [ADR 0008](docs/adr/0008-shared-listener.md).
 
 ## Security
 
