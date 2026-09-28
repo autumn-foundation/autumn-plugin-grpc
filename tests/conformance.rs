@@ -42,10 +42,10 @@ fn passes_the_framework_conformance_harness() {
     assert_eq!(
         listed(&routes),
         [
-            "GRPC /autumn.echo.v1.Echo/* public",
-            "GRPC /grpc.health.v1.Health/* public",
-            "GRPC /grpc.reflection.v1.ServerReflection/* public",
-            "GRPC /grpc.reflection.v1alpha.ServerReflection/* public",
+            "GRPC /autumn.echo.v1.Echo/* unclassified",
+            "GRPC /grpc.health.v1.Health/* framework",
+            "GRPC /grpc.reflection.v1.ServerReflection/* framework",
+            "GRPC /grpc.reflection.v1alpha.ServerReflection/* framework",
         ]
     );
 }
@@ -54,7 +54,7 @@ fn passes_the_framework_conformance_harness() {
 fn declarations_follow_the_configuration() {
     let plugin = common::echo_plugin()
         .development(false)
-        .gated("bearer token")
+        .guard_interceptor(Ok, "bearer token")
         .configure(|c| c.health = false);
     let routes = manifest(&plugin);
     assert_eq!(listed(&routes), ["GRPC /autumn.echo.v1.Echo/* gated"]);
@@ -62,6 +62,15 @@ fn declarations_follow_the_configuration() {
     assert_eq!(routes[0].middleware, ["bearer token"]);
     let report = run_conformance(&ConformanceConfig::new(plugin.name()), &routes);
     assert!(report.passed(), "{}", report.to_text_report());
+
+    let public = common::echo_plugin().public().development(false);
+    assert_eq!(
+        listed(&manifest(&public)),
+        [
+            "GRPC /autumn.echo.v1.Echo/* public",
+            "GRPC /grpc.health.v1.Health/* framework",
+        ]
+    );
 
     let disabled = common::echo_plugin().configure(|c| c.enabled = false);
     assert!(disabled.route_infos().is_empty());
@@ -85,13 +94,11 @@ fn declares_its_config_section() {
 }
 
 #[test]
-fn a_duplicate_registration_is_skipped() {
-    // The second plugin has an invalid config. If it were built, boot would
-    // fail. Autumn skips it because the name is the same.
-    let app = autumn_web::app()
-        .plugin(GrpcPlugin::new())
-        .plugin(GrpcPlugin::new().configure(|c| c.shutdown_grace_ms = 0));
-    assert!(app.has_plugin(&format!("{PLUGIN_NAME}@grpc")));
+fn two_plugins_with_one_section_share_a_name() {
+    // Autumn skips the second (see `a_duplicate_plugin_is_skipped_at_boot`).
+    let first = GrpcPlugin::new();
+    let second = GrpcPlugin::new().configure(|c| c.timeout_ms = 1);
+    assert_eq!(first.name(), second.name());
 }
 
 #[test]

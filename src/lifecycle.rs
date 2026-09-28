@@ -4,7 +4,7 @@
 //! stateDiagram-v2
 //!     [*] --> Idle
 //!     Idle --> Serving: Bound
-//!     Idle --> Failed: BindFailed
+//!     Idle --> Failed: StartFailed
 //!     Idle --> Stopped: ShutdownRequested
 //!     Serving --> Draining: ShutdownRequested
 //!     Serving --> Failed: ServerExited
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The state of one gRPC server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Lifecycle {
     /// Not started yet.
     Idle,
@@ -36,11 +37,12 @@ pub enum Lifecycle {
 
 /// An input to the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LifecycleEvent {
     /// The listener is bound.
     Bound,
-    /// The listener could not start.
-    BindFailed,
+    /// The server could not start (config, TLS, reflection or bind error).
+    StartFailed,
     /// The app asked the server to stop.
     ShutdownRequested,
     /// All in-flight calls ended, or the grace period expired.
@@ -53,11 +55,11 @@ impl Lifecycle {
     /// The next state after `event`, or `None` if `event` is illegal here.
     #[must_use]
     pub const fn next(self, event: LifecycleEvent) -> Option<Self> {
-        use LifecycleEvent::{BindFailed, Bound, Drained, ServerExited, ShutdownRequested};
+        use LifecycleEvent::{Bound, Drained, ServerExited, ShutdownRequested, StartFailed};
         match (self, event) {
             (Self::Idle, Bound) => Some(Self::Serving),
             (Self::Serving, ShutdownRequested) => Some(Self::Draining),
-            (Self::Idle, BindFailed) | (Self::Serving, ServerExited) => Some(Self::Failed),
+            (Self::Idle, StartFailed) | (Self::Serving, ServerExited) => Some(Self::Failed),
             (Self::Idle, ShutdownRequested) | (Self::Draining, Drained | ServerExited) => {
                 Some(Self::Stopped)
             }

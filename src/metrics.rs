@@ -5,17 +5,20 @@
 //! responses) or from the trailers. It records each call once, when the
 //! response body ends or is dropped.
 //!
-//! Label values come from the request path, which a client controls. To
-//! keep the series count bounded:
+//! Label values come from the request path, which a client controls. The
+//! layer keeps the series count bounded:
 //!
-//! - A service that is not registered is labelled `unknown`.
-//! - A call that returns `UNIMPLEMENTED` has method `unknown`.
-//! - After `max_metric_series` label sets, new ones count as `other`.
+//! - It labels a service that is not registered `unknown`.
+//! - It labels a method `unknown` until the method is known. A method is
+//!   known when a registered descriptor set lists it, or after its first
+//!   `OK` response. A path that does not exist cannot return `OK`.
+//! - After `max_metric_series` label sets, it counts new ones as `other`.
+//!   The `grpc_code` label stays (it has 17 values).
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -80,6 +83,8 @@ struct Series {
 struct Settings {
     max_series: usize,
     services: HashSet<String>,
+    /// Known methods, by service.
+    methods: HashMap<String, HashSet<String>>,
 }
 
 /// Shared metric state for one server.
@@ -87,7 +92,6 @@ pub struct Metrics {
     settings: RwLock<Settings>,
     series: Mutex<Series>,
     in_flight: AtomicI64,
-    up: AtomicBool,
 }
 
 impl Metrics {
@@ -96,25 +100,29 @@ impl Metrics {
             settings: RwLock::new(Settings {
                 max_series: 1000,
                 services: HashSet::new(),
+                methods: HashMap::new(),
             }),
             series: Mutex::new(Series::default()),
             in_flight: AtomicI64::new(0),
-            up: AtomicBool::new(false),
         }
     }
 
     /// Set the options that the startup hook knows.
-    pub fn configure(&self, max_series: usize, services: HashSet<String>) {
+    ///
+    /// `methods` are the known methods (from descriptor sets), by service.
+    pub fn configure(
+        &self,
+        max_series: usize,
+        services: HashSet<String>,
+        methods: HashMap<String, HashSet<String>>,
+    ) {
         let mut settings = self
             .settings
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         settings.max_series = max_series.max(1);
         settings.services = services;
-    }
-
-    pub fn set_up(&self, up: bool) {
-        self.up.store(up, Ordering::Release);
+        settings.methods = methods;
     }
 
     fn max_series(&self) -> usize {
@@ -124,33 +132,59 @@ impl Metrics {
             .max_series
     }
 
-    /// Bounded labels for a request path.
+    /// The registered service and the candidate method of a path. The
+    /// method is only a candidate: [`record`](Self::record) decides if it
+    /// is known.
     fn labels(&self, path: &str) -> (String, String) {
         let mut parts = path.trim_start_matches('/').splitn(2, '/');
         let service = parts.next().unwrap_or_default();
         let method = parts.next().unwrap_or_default();
         let settings = self.settings.read().unwrap_or_else(PoisonError::into_inner);
-        if settings.services.contains(service) && !method.is_empty() && !method.contains('/') {
+        if settings.services.contains(service) && is_method_name(method) {
             (service.to_owned(), method.to_owned())
         } else {
             (UNKNOWN.to_owned(), UNKNOWN.to_owned())
         }
     }
 
+    /// The method label. An `OK` response teaches a new method.
+    fn method_label(&self, service: &str, method: String, code: &str) -> String {
+        if service == UNKNOWN {
+            return UNKNOWN.to_owned();
+        }
+        let known = self
+            .settings
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .methods
+            .get(service)
+            .is_some_and(|methods| methods.contains(&method));
+        if known {
+            return method;
+        }
+        if code == "OK" {
+            self.settings
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .methods
+                .entry(service.to_owned())
+                .or_default()
+                .insert(method.clone());
+            return method;
+        }
+        UNKNOWN.to_owned()
+    }
+
     // False positive: `timed` borrows the guard until the last line.
     #[allow(clippy::significant_drop_tightening)]
     fn record(&self, service: String, method: String, code: i32, seconds: f64) {
         let code = code_name(code);
-        let method = if code == "UNIMPLEMENTED" {
-            UNKNOWN.to_owned()
-        } else {
-            method
-        };
+        let method = self.method_label(&service, method, code);
         let max_series = self.max_series();
         let mut series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         let mut key = (service, method, code);
         if !series.handled.contains_key(&key) && series.handled.len() >= max_series {
-            key = (OTHER.to_owned(), OTHER.to_owned(), OTHER);
+            key = (OTHER.to_owned(), OTHER.to_owned(), code);
         }
         let timed_key = (key.0.clone(), key.1.clone());
         *series.handled.entry(key).or_default() += 1;
@@ -160,7 +194,8 @@ impl Metrics {
     }
 
     /// A snapshot as Autumn metric families.
-    pub fn families(&self) -> Vec<MetricFamily> {
+    /// `up` is the `grpc_server_up` value.
+    pub fn families(&self, up: bool) -> Vec<MetricFamily> {
         let series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         let mut handled: Vec<MetricSample> = series
             .handled
@@ -198,11 +233,7 @@ impl Metrics {
         drop(series);
         #[allow(clippy::cast_precision_loss)]
         let in_flight = self.in_flight.load(Ordering::Acquire) as f64;
-        let up = if self.up.load(Ordering::Acquire) {
-            1.0
-        } else {
-            0.0
-        };
+        let up = if up { 1.0 } else { 0.0 };
         vec![
             family(
                 names::HANDLED,
@@ -254,6 +285,43 @@ const fn unlabelled(value: f64) -> MetricSample {
     }
 }
 
+/// `true` for a plausible protobuf method name: an ASCII identifier of at
+/// most 64 characters.
+fn is_method_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The methods of each service in encoded `FileDescriptorSet`s. A set that
+/// does not decode adds nothing (reflection reports that error).
+pub fn methods_from_descriptors(sets: &[&[u8]]) -> HashMap<String, HashSet<String>> {
+    use prost::Message as _;
+
+    let mut methods: HashMap<String, HashSet<String>> = HashMap::new();
+    for set in sets {
+        let Ok(decoded) = prost_types::FileDescriptorSet::decode(*set) else {
+            continue;
+        };
+        for file in decoded.file {
+            let package = file.package.unwrap_or_default();
+            for service in file.service {
+                let name = service.name.unwrap_or_default();
+                let full = if package.is_empty() {
+                    name
+                } else {
+                    format!("{package}.{name}")
+                };
+                methods
+                    .entry(full)
+                    .or_default()
+                    .extend(service.method.into_iter().filter_map(|m| m.name));
+            }
+        }
+    }
+    methods
+}
+
 /// Records one call when dropped.
 struct CallGuard {
     metrics: Arc<Metrics>,
@@ -283,9 +351,9 @@ impl CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
-        // Trailers win. Then trailers-only headers. A body that ends with
-        // no status is UNKNOWN. A body dropped before its end is CANCELLED.
+        // First use the trailers. If they have no status, use the headers
+        // (a trailers-only response). A body that ends with no status is
+        // UNKNOWN. A body that the client drops before its end is CANCELLED.
         let code = self
             .trailer_code
             .or(self.header_code)
@@ -296,6 +364,8 @@ impl Drop for CallGuard {
             code,
             self.started.elapsed().as_secs_f64(),
         );
+        // Last, so `in_flight == 0` means each call is in the counters.
+        self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -324,8 +394,9 @@ impl http_body::Body for TrackedBody {
                     this.guard.trailer_code = status_in(trailers);
                 }
             }
-            Poll::Ready(None) => this.guard.ended = true,
-            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+            // A body error is not a client cancel: count it as UNKNOWN.
+            Poll::Ready(None | Some(Err(_))) => this.guard.ended = true,
+            Poll::Pending => {}
         }
         polled
     }
@@ -388,6 +459,8 @@ where
         Box::pin(async move {
             let response = future.await?;
             guard.header_code = status_in(response.headers());
+            // hyper does not poll a body that is already at its end.
+            guard.ended = http_body::Body::is_end_stream(response.body());
             let (parts, body) = response.into_parts();
             let body = Body::new(TrackedBody { inner: body, guard });
             Ok(Response::from_parts(parts, body))
@@ -413,7 +486,7 @@ mod tests {
     #[test]
     fn labels_are_bounded() {
         let metrics = Metrics::new();
-        metrics.configure(10, HashSet::from(["a.B".to_owned()]));
+        metrics.configure(10, HashSet::from(["a.B".to_owned()]), HashMap::new());
         assert_eq!(metrics.labels("/a.B/Call"), ("a.B".into(), "Call".into()));
         assert_eq!(
             metrics.labels("/x.Y/Call"),
@@ -421,21 +494,54 @@ mod tests {
         );
         assert_eq!(metrics.labels("/a.B/"), (UNKNOWN.into(), UNKNOWN.into()));
         assert_eq!(metrics.labels("/a.B/C/D"), (UNKNOWN.into(), UNKNOWN.into()));
+        let long = format!("/a.B/{}", "x".repeat(65));
+        assert_eq!(metrics.labels(&long), (UNKNOWN.into(), UNKNOWN.into()));
+        assert_eq!(
+            metrics.labels("/a.B/b%20c"),
+            (UNKNOWN.into(), UNKNOWN.into())
+        );
         assert_eq!(metrics.labels(""), (UNKNOWN.into(), UNKNOWN.into()));
     }
 
     #[test]
     fn a_dropped_guard_counts_as_cancelled_and_an_ended_one_as_unknown() {
         let metrics = Arc::new(Metrics::new());
-        metrics.configure(10, HashSet::from(["a.B".to_owned()]));
+        metrics.configure(10, HashSet::from(["a.B".to_owned()]), HashMap::new());
         drop(CallGuard::start(metrics.clone(), "/a.B/C"));
         let mut ended = CallGuard::start(metrics.clone(), "/a.B/C");
         ended.ended = true;
         drop(ended);
         let series = metrics.series.lock().unwrap();
-        assert_eq!(series.handled[&("a.B".into(), "C".into(), "CANCELLED")], 1);
-        assert_eq!(series.handled[&("a.B".into(), "C".into(), "UNKNOWN")], 1);
+        // `C` is not known yet (no descriptor, no OK), so it is `unknown`.
+        assert_eq!(
+            series.handled[&("a.B".into(), UNKNOWN.into(), "CANCELLED")],
+            1
+        );
+        assert_eq!(
+            series.handled[&("a.B".into(), UNKNOWN.into(), "UNKNOWN")],
+            1
+        );
         drop(series);
         assert_eq!(metrics.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_ok_response_teaches_a_method() {
+        let metrics = Metrics::new();
+        metrics.configure(10, HashSet::from(["a.B".to_owned()]), HashMap::new());
+        assert_eq!(
+            metrics.method_label("a.B", "C".into(), "UNAUTHENTICATED"),
+            UNKNOWN
+        );
+        assert_eq!(metrics.method_label("a.B", "C".into(), "OK"), "C");
+        assert_eq!(metrics.method_label("a.B", "C".into(), "INTERNAL"), "C");
+        assert_eq!(metrics.method_label(UNKNOWN, "C".into(), "OK"), UNKNOWN);
+    }
+
+    #[test]
+    fn descriptors_list_methods() {
+        let methods = methods_from_descriptors(&[tonic_health::pb::FILE_DESCRIPTOR_SET, b"junk"]);
+        let health = &methods["grpc.health.v1.Health"];
+        assert!(health.contains("Check") && health.contains("Watch"));
     }
 }

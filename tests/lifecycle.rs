@@ -15,16 +15,16 @@ use autumn_plugin_grpc::{Lifecycle, LifecycleEvent};
 use proptest::prelude::*;
 
 use Lifecycle::{Draining, Failed, Idle, Serving, Stopped};
-use LifecycleEvent::{BindFailed, Bound, Drained, ServerExited, ShutdownRequested};
+use LifecycleEvent::{Bound, Drained, ServerExited, ShutdownRequested, StartFailed};
 
 const STATES: [Lifecycle; 5] = [Idle, Serving, Draining, Stopped, Failed];
-const EVENTS: [LifecycleEvent; 5] = [Bound, BindFailed, ShutdownRequested, Drained, ServerExited];
+const EVENTS: [LifecycleEvent; 5] = [Bound, StartFailed, ShutdownRequested, Drained, ServerExited];
 
 /// The specification: the only legal transitions.
 fn spec(state: Lifecycle, event: LifecycleEvent) -> Option<Lifecycle> {
     match (state, event) {
         (Idle, Bound) => Some(Serving),
-        (Idle, BindFailed) => Some(Failed),
+        (Idle, StartFailed) => Some(Failed),
         (Idle, ShutdownRequested) => Some(Stopped),
         (Serving, ShutdownRequested) => Some(Draining),
         (Serving, ServerExited) => Some(Failed),
@@ -93,6 +93,7 @@ const fn rank(state: Lifecycle) -> u8 {
         Serving => 1,
         Draining => 2,
         Stopped | Failed => 3,
+        _ => u8::MAX,
     }
 }
 

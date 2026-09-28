@@ -59,7 +59,8 @@ async fn tls_channel(
     addr: std::net::SocketAddr,
     tls: ClientTlsConfig,
 ) -> Result<Channel, tonic::transport::Error> {
-    Channel::from_shared(format!("https://localhost:{}", addr.port()))
+    // 127.0.0.1, not `localhost`: some runners resolve `localhost` to ::1.
+    Channel::from_shared(format!("https://127.0.0.1:{}", addr.port()))
         .unwrap()
         .tls_config(tls)
         .unwrap()
@@ -145,4 +146,54 @@ fn a_missing_certificate_file_aborts_boot() {
     .join()
     .unwrap();
     assert!(outcome.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn optional_mtls_accepts_both_kinds_of_client() {
+    let pki = pki("optional");
+    let dir = pki.dir.clone();
+    let plugin = common::echo_plugin().configure(move |c| {
+        c.tls.cert_path = path(&dir, "server.pem");
+        c.tls.key_path = path(&dir, "server.key");
+        c.tls.client_ca_path = path(&dir, "ca.pem");
+        c.tls.client_auth_optional = true;
+    });
+    let (_http, handle) = common::boot(plugin);
+    let addr = handle.local_addr().unwrap();
+
+    let anonymous = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&pki.ca_pem))
+        .domain_name("localhost");
+    let channel = tls_channel(addr, anonymous).await.unwrap();
+    assert_eq!(say(channel).await.unwrap(), "secure");
+
+    let identified = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&pki.ca_pem))
+        .identity(Identity::from_pem(&pki.client_cert, &pki.client_key))
+        .domain_name("localhost");
+    let channel = tls_channel(addr, identified).await.unwrap();
+    assert_eq!(say(channel).await.unwrap(), "secure");
+    handle.shutdown().await;
+}
+
+#[test]
+fn a_missing_client_ca_file_aborts_boot() {
+    let dir = pki("missing-ca").dir;
+    let plugin = common::echo_plugin().configure(move |c| {
+        c.tls.cert_path = path(&dir, "server.pem");
+        c.tls.key_path = path(&dir, "server.key");
+        c.tls.client_ca_path = path(&dir, "no-such-ca.pem");
+    });
+    let handle = plugin.handle();
+    let outcome = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
+        }))
+    })
+    .join()
+    .unwrap();
+    assert!(outcome.is_err());
+    assert!(handle.local_addr().is_none(), "no listener without TLS");
 }

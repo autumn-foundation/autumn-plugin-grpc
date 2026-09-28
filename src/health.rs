@@ -1,9 +1,9 @@
-//! Bridges into Autumn's actuator: a health indicator and a metrics source.
+//! The Autumn health indicator.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, MetricFamily, MetricsSource};
+use autumn_web::actuator::{HealthCheckOutput, HealthIndicator};
 use futures_util::future::BoxFuture;
 
 use crate::server::Shared;
@@ -30,16 +30,5 @@ impl HealthIndicator for GrpcHealthIndicator {
             };
             output.with_details(details)
         })
-    }
-}
-
-/// Exposes `grpc_server_*` families on `/actuator/prometheus`.
-pub struct GrpcMetricsSource {
-    pub shared: Arc<Shared>,
-}
-
-impl MetricsSource for GrpcMetricsSource {
-    fn collect(&self) -> Vec<MetricFamily> {
-        self.shared.metrics.families()
     }
 }

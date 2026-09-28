@@ -60,12 +60,19 @@ async fn watch_sees_not_serving_when_shutdown_starts() {
 
     let stopper = handle.clone();
     let shutdown = tokio::spawn(async move { stopper.shutdown().await });
-    let next = tokio::time::timeout(std::time::Duration::from_secs(5), watch.message())
+    let update = tokio::time::timeout(std::time::Duration::from_secs(5), watch.message())
         .await
-        .expect("a status update before the stream ends");
-    if let Ok(Some(update)) = next {
-        assert_eq!(update.status(), ServingStatus::NotServing);
-    }
+        .expect("an update before the timeout")
+        .expect("no stream error")
+        .expect("an update before the stream ends");
+    assert_eq!(update.status(), ServingStatus::NotServing);
+    // The drain clears the status, so the stream ends and does not hold
+    // the drain open.
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(Some(_)) = watch.message().await {}
+    })
+    .await;
+    assert!(end.is_ok(), "the watch stream ends");
     shutdown.await.unwrap();
 }
 

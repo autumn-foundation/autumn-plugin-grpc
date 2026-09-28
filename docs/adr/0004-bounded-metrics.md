@@ -13,9 +13,15 @@ and in Prometheus. Autumn's `MetricsSource` has counters and gauges only.
 
 - Only registered services (user, health, reflection) keep their name.
   Other services are `unknown`.
-- A call that returns `UNIMPLEMENTED` has method `unknown`.
-- `max_metric_series` (default 1000) caps label sets. Extra calls count
-  under `other`.
+- A method keeps its name only when it is known: a registered descriptor
+  set lists it, or it returned `OK` once. A path that does not exist
+  cannot return `OK`. Other methods are `unknown`. (Review finding: with
+  an auth guard, random method names returned `UNAUTHENTICATED` and
+  filled the label budget.)
+- `max_metric_series` (default 1000) caps label sets. Over the cap, the
+  service and method labels are `other`. The code label stays (17 values).
+- Autumn keeps one family per name. One source reports all servers of an
+  app, with a `server` label.
 - Latency is a `_sum` and `_count` counter pair, not a histogram.
 - Names start with `grpc_server_`. Autumn drops names that start with
   `autumn_`.

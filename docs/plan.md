@@ -61,7 +61,7 @@ Each answer gives a countermeasure.
 | Reflection leaks the API shape in production. | Reflection is `auto`: on in `dev`/`test`, off in other profiles. |
 | Auth layer blocks Kubernetes health probes. | User layers wrap user services only. Health and reflection are not wrapped. |
 | Metric names start with `autumn_`. Autumn drops them. | Use the `grpc_server_` prefix. |
-| Handler panics or `unwrap` in library code. | No `unwrap`/`expect`/`panic!` in library code. Clippy denies them. |
+| Handler panics or `unwrap` in library code. | No `unwrap`/`expect`/`panic!` in library code. Clippy warns, and CI makes warnings errors. |
 | TLS paths set, but the crate is built without TLS. Traffic is plain text. | This is a config error. Boot stops. |
 | Invalid lifecycle order (serve after stop). | A pure state machine owns the lifecycle. Tests check every transition. |
 
@@ -77,8 +77,8 @@ tonic 0.14 uses axum 0.8, the same version as Autumn.
 `protoc` and Verus are not in the build environment.
 
 **Red (feelings).**
-One-line install must feel like Autumn. `grpcurl list` on a fresh app
-must "just work" in dev. Operators must trust the health signal.
+Install with one line, as other Autumn plugins do. `grpcurl list` must
+work in dev with no setup. Operators must trust the health signal.
 
 **Black (risks).**
 Two ports need two firewall rules. Feature unification can change
@@ -118,7 +118,7 @@ Decisions:
 | AC4 | The standard health service `grpc.health.v1.Health` is on by default. It reports SERVING for each service after start, and NOT_SERVING when shutdown starts. |
 | AC5 | Server reflection (v1 and v1alpha) serves the registered descriptor sets. It is `auto`: on in `dev`/`test`, off in other profiles. |
 | AC6 | The plugin reports to Autumn: a `grpc` health indicator in `/actuator/health`, and `grpc_server_*` Prometheus metrics by service, method and code. Metric label count is bounded. |
-| AC7 | On shutdown, the plugin sets NOT_SERVING, stops new connections, drains in-flight calls for `shutdown_grace_ms`, then aborts. Shutdown is idempotent. |
+| AC7 | On shutdown, the plugin sets NOT_SERVING, stops new connections, drains in-flight calls for `shutdown_grace_ms`, then closes the open connections. Shutdown is idempotent. |
 | AC8 | A bind failure aborts boot. |
 | AC9 | Transport settings are configurable: timeout, concurrency limit, max concurrent streams, HTTP/2 keepalive, max connection age, TCP nodelay and keepalive. |
 | AC10 | Feature `tls` enables TLS and mTLS from file paths. TLS paths without the feature abort boot. |

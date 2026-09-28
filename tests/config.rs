@@ -26,7 +26,27 @@ fn env_for(dir: &std::path::Path) -> MockEnv {
 fn defaults_are_production_safe() {
     let config = GrpcConfig::default();
     assert!(config.enabled);
-    assert_eq!(config.bind, "0.0.0.0:50051");
+    assert_eq!(config.bind, "", "the profile decides");
+    assert_eq!(
+        config.bind_addr(true).unwrap().to_string(),
+        "127.0.0.1:50051"
+    );
+    assert_eq!(
+        config.bind_addr(false).unwrap().to_string(),
+        "0.0.0.0:50051"
+    );
+    assert_eq!(config.max_concurrent_streams, 200);
+    assert_eq!(config.http2_max_local_error_reset_streams, 1024);
+    assert_eq!(config.max_connections, 1000);
+    assert_eq!(
+        config.http2_keepalive_interval(),
+        Some(Duration::from_secs(60))
+    );
+    assert_eq!(
+        config.http2_keepalive_timeout(),
+        Some(Duration::from_secs(20))
+    );
+    assert_eq!(config.tls.handshake_timeout(), Duration::from_secs(10));
     assert!(config.health);
     assert_eq!(config.reflection, Toggle::Auto);
     assert!(config.metrics);
@@ -90,6 +110,19 @@ fn bad_values_are_rejected() {
         ("[grpc]\nbind = \"not an address\"", "bind"),
         ("[grpc]\nshutdown_grace_ms = 0", "shutdown_grace_ms"),
         ("[grpc]\nmax_metric_series = 0", "max_metric_series"),
+        (
+            "[grpc]\nmax_concurrent_streams = 0",
+            "max_concurrent_streams",
+        ),
+        (
+            "[grpc]\nhttp2_max_local_error_reset_streams = 0",
+            "http2_max_local_error_reset_streams",
+        ),
+        (
+            "[grpc.tls]\nhandshake_timeout_ms = 0",
+            "handshake_timeout_ms",
+        ),
+        ("[grpc.tls]\nclient_auth_optional = true", "client_ca_path"),
         ("[grpc]\nreflection = \"sometimes\"", "sometimes"),
         ("[grpc.tls]\ncert_path = \"a.pem\"", "key_path"),
         ("[grpc.tls]\nclient_ca_path = \"ca.pem\"", "cert_path"),
@@ -144,34 +177,49 @@ fn resolves_profiles_files_and_environment_in_order() {
         .with("AUTUMN_ENV", "prod")
         .with("AUTUMN_GRPC__BIND", "127.0.0.1:2000");
     let resolved = GrpcConfig::resolve_with_env("grpc", &env).unwrap();
-    assert_eq!(resolved.profile, "prod");
+    assert_eq!(resolved.profile(), "prod");
     assert!(!resolved.is_development());
-    assert_eq!(resolved.config.bind, "127.0.0.1:2000", "env wins");
-    assert_eq!(resolved.config.timeout_ms, 200, "inline profile applies");
+    assert_eq!(resolved.config().bind, "127.0.0.1:2000", "env wins");
+    assert_eq!(resolved.config().timeout_ms, 200, "inline profile applies");
     assert_eq!(
-        resolved.config.shutdown_grace_ms, 333,
+        resolved.config().shutdown_grace_ms,
+        333,
         "profile file applies"
     );
 
     let dev = GrpcConfig::resolve_with_env("grpc", &env_for(&dir)).unwrap();
     assert!(dev.is_development());
-    assert_eq!(dev.config.timeout_ms, 100);
-    assert_eq!(dev.config.shutdown_grace_ms, 111);
+    assert_eq!(dev.config().timeout_ms, 100);
+    assert_eq!(dev.config().shutdown_grace_ms, 111);
 }
 
 #[test]
-fn nested_env_overrides_apply_and_bad_ones_are_ignored() {
+fn nested_env_overrides_apply() {
     let dir = temp_dir("env");
     let env = env_for(&dir)
         .with("AUTUMN_GRPC__TLS__CERT_PATH", "cert.pem")
         .with("AUTUMN_GRPC__TLS__KEY_PATH", "key.pem")
-        .with("AUTUMN_GRPC__TIMEOUT_MS", "not-a-number")
         .with("AUTUMN_GRPC__REFLECTION", "true");
     let resolved = GrpcConfig::resolve_with_env("grpc", &env).unwrap();
-    assert_eq!(resolved.config.tls.cert_path, "cert.pem");
-    assert_eq!(resolved.config.tls.key_path, "key.pem");
-    assert_eq!(resolved.config.timeout_ms, 0, "bad override ignored");
-    assert_eq!(resolved.config.reflection, Toggle::On);
+    assert_eq!(resolved.config().tls.cert_path, "cert.pem");
+    assert_eq!(resolved.config().tls.key_path, "key.pem");
+    assert_eq!(resolved.config().reflection, Toggle::On);
+}
+
+#[test]
+fn a_bad_env_override_stops_boot() {
+    let dir = temp_dir("bad-env");
+    std::fs::write(dir.join("autumn.toml"), "[grpc]\nreflection = true\n").unwrap();
+    for (key, value) in [
+        ("AUTUMN_GRPC__TIMEOUT_MS", "not-a-number"),
+        // `0` is an integer, not a toggle: the file value must not survive.
+        ("AUTUMN_GRPC__REFLECTION", "0"),
+        ("AUTUMN_GRPC__TLS__CLIENT_AUTH_OPTIONAL", "False"),
+    ] {
+        let env = env_for(&dir).with(key, value);
+        let error = GrpcConfig::resolve_with_env("grpc", &env).unwrap_err();
+        assert!(error.message().contains(key), "{key}: {error}");
+    }
 }
 
 #[test]
@@ -184,8 +232,8 @@ fn a_custom_section_uses_its_own_env_prefix() {
     .unwrap();
     let env = env_for(&dir).with("AUTUMN_GRPC_ADMIN__TIMEOUT_MS", "9");
     let resolved = GrpcConfig::resolve_with_env("grpc_admin", &env).unwrap();
-    assert_eq!(resolved.config.bind, "127.0.0.1:7000");
-    assert_eq!(resolved.config.timeout_ms, 9);
+    assert_eq!(resolved.config().bind, "127.0.0.1:7000");
+    assert_eq!(resolved.config().timeout_ms, 9);
 }
 
 #[test]
@@ -291,4 +339,56 @@ async fn transport_settings_apply_to_the_server() {
         "{status:?}"
     );
     handle.shutdown().await;
+}
+
+#[test]
+fn each_layer_beats_the_one_before() {
+    let dir = temp_dir("precedence");
+    std::fs::write(
+        dir.join("autumn.toml"),
+        "[grpc]\ntimeout_ms = 1\n[profile.prod.grpc]\ntimeout_ms = 2\n",
+    )
+    .unwrap();
+    let prod = || env_for(&dir).with("AUTUMN_ENV", "prod");
+    let timeout = |env: &MockEnv| {
+        GrpcConfig::resolve_with_env("grpc", env)
+            .unwrap()
+            .config()
+            .timeout_ms
+    };
+    assert_eq!(timeout(&env_for(&dir)), 1, "base");
+    assert_eq!(timeout(&prod()), 2, "inline profile beats base");
+    std::fs::write(dir.join("autumn-prod.toml"), "[grpc]\ntimeout_ms = 3\n").unwrap();
+    assert_eq!(timeout(&prod()), 3, "profile file beats inline profile");
+    assert_eq!(
+        timeout(&prod().with("AUTUMN_GRPC__TIMEOUT_MS", "4")),
+        4,
+        "env beats profile file"
+    );
+}
+
+#[test]
+fn profile_aliases_and_names_resolve() {
+    let dir = temp_dir("aliases");
+    std::fs::write(
+        dir.join("autumn.toml"),
+        "[profile.production.grpc]\ntimeout_ms = 7\n[profile.development.grpc]\ntimeout_ms = 8\n",
+    )
+    .unwrap();
+    let resolve = |env: MockEnv| GrpcConfig::resolve_with_env("grpc", &env).unwrap();
+
+    let prod = resolve(env_for(&dir).with("AUTUMN_PROFILE", "production"));
+    assert_eq!(prod.profile(), "prod");
+    assert!(!prod.is_development());
+    assert_eq!(prod.config().timeout_ms, 7, "legacy `production` alias");
+
+    let dev = resolve(env_for(&dir));
+    assert_eq!(dev.profile(), "dev");
+    assert_eq!(dev.config().timeout_ms, 8, "legacy `development` alias");
+
+    let test = resolve(env_for(&dir).with("AUTUMN_ENV", "test"));
+    assert!(test.is_development(), "`test` gets development defaults");
+
+    let debug_off = resolve(env_for(&dir).with("AUTUMN_IS_DEBUG", "0"));
+    assert_eq!(debug_off.profile(), "prod");
 }

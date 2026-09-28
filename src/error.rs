@@ -25,6 +25,13 @@ pub enum GrpcError {
     /// TLS could not be set up.
     #[error("cannot set up gRPC TLS: {0}")]
     Tls(String),
+    /// Two services have the same name, or a user service has the name of
+    /// a plugin service (health or reflection).
+    #[error("gRPC service `{0}` is added twice; each service name must be unique")]
+    DuplicateService(String),
+    /// The server is not in `Idle`: a shutdown came before or during start.
+    #[error("the gRPC server cannot start in state `{0}`")]
+    NotIdle(crate::lifecycle::Lifecycle),
     /// The startup hook ran twice.
     #[error("the gRPC server is already started")]
     AlreadyStarted,

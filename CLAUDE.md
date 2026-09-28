@@ -21,22 +21,32 @@ No `protoc` is necessary. `tests/codegen.rs` uses `protox`.
 
 See `docs/architecture.md`. `plugin.rs` (builder, `Plugin`, route
 assembly), `config.rs`, `server.rs` (listener, `GrpcHandle`, drain),
-`lifecycle.rs`, `metrics.rs`, `health.rs`, `tls.rs`, `error.rs`.
+`lifecycle.rs`, `metrics.rs`, `registry.rs` (`GrpcServers`, the one
+metrics source), `health.rs`, `tls.rs`, `error.rs`.
 
 ## Rules
 
 - **State changes only through `LifecycleCell::apply`.** Change the spec
   table in `tests/lifecycle.rs` first.
 - **User layers wrap user services only.** Add plugin services after the
-  user layers in `build_routes`.
-- **Metric labels stay bounded.** New labels need a bound and a test in
-  `tests/metrics.rs`. Names must not start with `autumn_`.
+  user layers in `build_routes`. Auth goes through `guard*`, so
+  `autumn routes` shows the service as gated.
+- **Set every hyper limit explicitly.** tonic passes `None`, and `None`
+  removes the hyper default (ADR 0006).
+- **Shutdown work runs in the drain task**, not in the caller. Autumn can
+  drop the hook future (ADR 0007).
+- **Metric labels stay bounded.** A method label needs a descriptor or an
+  `OK` response. New labels need a bound and a test in `tests/metrics.rs`.
+  Names must not start with `autumn_`.
 - **Config:** a new key goes in `config.rs` with a safe default, a doc
   comment, validation if a value can fail, and a line in the README TOML
   block. Env overrides come from the leaf keys. Use `0`/`""` for "unset",
   not `Option` (env derivation needs a leaf).
 - **Startup errors abort boot.** Return `GrpcError` from the startup hook.
-  Never fall back silently (for example, to plain text).
+  Never fall back silently (for example, to plain text). A bad env
+  override is an error too.
+- **Tests:** pin `.development(..)` on each plugin that boots. Wait with
+  `common::settle` or `common::eventually`, not a fixed sleep.
 - No `unwrap`/`expect`/`panic!` in library code. Tests may use them.
 - No behavior without a test. Record decisions in `docs/adr/NNNN-*.md`.
 - Docs and comments: short, ASD-STE100 style (simple words, active voice,

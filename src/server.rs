@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use autumn_web::AppState;
 use autumn_web::actuator::MetricFamily;
 use futures_util::{Stream, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tokio_util::sync::{CancellationToken, PollSemaphore, WaitForCancellationFutureOwned};
 use tonic::service::Routes;
 use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming};
 use tonic_health::ServingStatus;
@@ -37,7 +38,8 @@ pub struct Shared {
     grace_ms: AtomicU64,
     /// Ends the accept loop and starts tonic's graceful shutdown.
     stop: CancellationToken,
-    /// Closes every open connection (used after the grace period).
+    /// Closes every open connection. The drain uses it after the grace
+    /// period.
     kill: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     stopped: watch::Sender<bool>,
@@ -63,11 +65,60 @@ impl Shared {
         Duration::from_millis(self.grace_ms.load(Ordering::Acquire))
     }
 
-    fn mark_stopped(&self) {
-        self.metrics.set_up(false);
+    pub fn mark_stopped(&self) {
         self.stopped.send_replace(true);
     }
+
+    /// Set the status of `""` and each user service.
+    async fn set_health(&self, status: ServingStatus) {
+        if let Some(reporter) = self.health.get() {
+            reporter.set_service_status("", status).await;
+            for name in self.health_names.get().into_iter().flatten() {
+                reporter.set_service_status(name, status).await;
+            }
+        }
+    }
+
+    /// The drain sequence. It runs in its own task, so it completes even
+    /// when Autumn drops a shutdown hook that runs too long.
+    async fn drain(self: Arc<Self>) {
+        self.set_health(ServingStatus::NotServing).await;
+        // Clear the statuses. This ends open `Watch` streams after they get
+        // `NOT_SERVING`, so they do not hold the drain open.
+        if let Some(reporter) = self.health.get() {
+            let mut reporter = reporter.clone();
+            reporter.clear_service_status("").await;
+            for name in self.health_names.get().into_iter().flatten() {
+                reporter.clear_service_status(name).await;
+            }
+        }
+        self.stop.cancel();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut task) = task {
+            let grace = self.grace();
+            if tokio::time::timeout(grace, &mut task).await.is_err() {
+                tracing::warn!(
+                    grace_ms = grace.as_millis(),
+                    "gRPC calls still open after the grace period; closing connections"
+                );
+                self.kill.cancel();
+                if tokio::time::timeout(KILL_WAIT, &mut task).await.is_err() {
+                    task.abort();
+                }
+            }
+        }
+        let _ = self.lifecycle.apply(LifecycleEvent::Drained);
+        self.mark_stopped();
+        tracing::info!("gRPC server stopped");
+    }
 }
+
+/// Time for killed connections to close before the plugin aborts the task.
+pub const KILL_WAIT: Duration = Duration::from_secs(1);
 
 /// A handle to the gRPC server of one plugin.
 ///
@@ -130,7 +181,7 @@ impl GrpcHandle {
     /// The current `grpc_server_*` metric families.
     #[must_use]
     pub fn metric_families(&self) -> Vec<MetricFamily> {
-        self.shared.metrics.families()
+        self.shared.metrics.families(self.state().is_ready())
     }
 
     /// Stop the server.
@@ -138,69 +189,31 @@ impl GrpcHandle {
     /// 1. Set every health status to `NOT_SERVING`.
     /// 2. Stop accepting connections. Tell clients to go away (HTTP/2
     ///    `GOAWAY`).
-    /// 3. Wait for in-flight calls, up to `shutdown_grace_ms`.
+    /// 3. Wait for in-flight calls, up to the grace period.
     /// 4. Close the connections that are still open.
     ///
-    /// Safe to call more than once and from many tasks. Each call returns
-    /// when the server has stopped.
+    /// A task does the drain. If you drop this future, the drain continues.
+    /// You can call this method more than once, from many tasks. Each call
+    /// returns after the server stops.
     pub async fn shutdown(&self) {
         let shared = &self.shared;
         match shared.lifecycle.apply(LifecycleEvent::ShutdownRequested) {
-            Ok(Lifecycle::Draining) => {}
-            Ok(_) => {
-                // Not started: nothing to drain.
-                shared.mark_stopped();
-                return;
+            Ok(Lifecycle::Draining) => {
+                tokio::spawn(shared.clone().drain());
             }
-            Err(Lifecycle::Draining) => {
-                let mut stopped = shared.stopped.subscribe();
-                let _ = stopped.wait_for(|done| *done).await;
-                return;
-            }
-            Err(_) => return,
+            // From `Idle`: nothing to drain.
+            Ok(_) => shared.mark_stopped(),
+            Err(_) => {}
         }
-        shared.metrics.set_up(false);
-        if let Some(reporter) = shared.health.get() {
-            reporter
-                .set_service_status("", ServingStatus::NotServing)
-                .await;
-            for name in shared.health_names.get().into_iter().flatten() {
-                reporter
-                    .set_service_status(name, ServingStatus::NotServing)
-                    .await;
-            }
-        }
-        shared.stop.cancel();
-        let task = shared
-            .task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(mut task) = task {
-            let grace = shared.grace();
-            if tokio::time::timeout(grace, &mut task).await.is_err() {
-                tracing::warn!(
-                    grace_ms = grace.as_millis(),
-                    "gRPC calls still open after the grace period; closing connections"
-                );
-                shared.kill.cancel();
-                if tokio::time::timeout(Duration::from_secs(1), &mut task)
-                    .await
-                    .is_err()
-                {
-                    task.abort();
-                }
-            }
-        }
-        let _ = shared.lifecycle.apply(LifecycleEvent::Drained);
-        shared.mark_stopped();
-        tracing::info!("gRPC server stopped");
+        let mut stopped = shared.stopped.subscribe();
+        let _ = stopped.wait_for(|done| *done).await;
     }
 }
 
 /// Everything [`start`] needs.
 pub struct Launch {
     pub config: GrpcConfig,
+    pub development: bool,
     pub routes: Routes,
     pub health: Option<HealthReporter>,
     pub health_names: Vec<String>,
@@ -212,24 +225,29 @@ pub struct Launch {
 pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, GrpcError> {
     let Launch {
         config,
+        development,
         routes,
         health,
         health_names,
         #[cfg(feature = "tls")]
         tls,
     } = launch;
-    let addr = config.bind_addr()?;
+    if shared.lifecycle.get() != Lifecycle::Idle {
+        return Err(GrpcError::NotIdle(shared.lifecycle.get()));
+    }
+    let addr = config.bind_addr(development)?;
     let listener = bind(addr).map_err(|source| GrpcError::Bind { addr, source })?;
     let local_addr = listener
         .local_addr()
         .map_err(|source| GrpcError::Bind { addr, source })?;
 
+    // tonic passes `None` to hyper, and `None` removes hyper's own limits.
+    // So always set the stream and reset limits.
     let mut builder = tonic::transport::Server::builder()
-        .max_concurrent_streams(
-            (config.max_concurrent_streams > 0).then_some(config.max_concurrent_streams),
-        )
+        .max_concurrent_streams(Some(config.max_concurrent_streams))
+        .http2_max_local_error_reset_streams(Some(config.http2_max_local_error_reset_streams))
         .http2_keepalive_interval(config.http2_keepalive_interval())
-        .trace_fn(|request| tracing::info_span!("grpc", path = %request.uri().path()));
+        .trace_fn(|request| tracing::debug_span!("grpc", path = %request.uri().path()));
     if config.concurrency_limit_per_connection > 0 {
         builder = builder.concurrency_limit_per_connection(config.concurrency_limit_per_connection);
     }
@@ -249,55 +267,83 @@ pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, G
             .map_err(|e| GrpcError::Tls(e.to_string()))?;
     }
 
-    let incoming = TcpIncoming::from(listener)
-        .with_nodelay(Some(config.tcp_nodelay))
-        .with_keepalive(config.tcp_keepalive());
-    let kill = shared.kill.clone();
-    let incoming = StopOnCancel {
-        inner: Some(incoming),
-        stop: Box::pin(shared.stop.clone().cancelled_owned()),
-    }
-    .map(move |accepted| accepted.map(|stream| Killable::new(stream, kill.clone())));
-
-    if let Some(reporter) = &health {
-        reporter
-            .set_service_status("", ServingStatus::Serving)
-            .await;
-        for name in &health_names {
-            reporter
-                .set_service_status(name, ServingStatus::Serving)
-                .await;
-        }
-        let _ = shared.health.set(reporter.clone());
+    if let Some(reporter) = health {
+        let _ = shared.health.set(reporter);
     }
     let _ = shared.health_names.set(health_names);
+    shared.set_health(ServingStatus::Serving).await;
     shared
         .grace_ms
         .store(config.shutdown_grace_ms, Ordering::Release);
     let _ = shared.local_addr.set(local_addr);
 
     let stop = shared.stop.clone();
-    let task_shared = shared.clone();
-    let server = builder
-        .add_routes(routes)
-        .serve_with_incoming_shutdown(incoming, stop.cancelled_owned());
+    let exit = ExitGuard(shared.clone());
+    let server = builder.add_routes(routes).serve_with_incoming_shutdown(
+        Accept::new(listener, &config, shared),
+        stop.cancelled_owned(),
+    );
     let task = tokio::spawn(async move {
+        let _exit = exit;
         if let Err(error) = server.await {
             tracing::error!(%error, "gRPC server ended with an error");
         }
-        if task_shared.lifecycle.apply(LifecycleEvent::ServerExited) == Ok(Lifecycle::Failed) {
-            tracing::error!("gRPC server stopped unexpectedly");
-            task_shared.mark_stopped();
-        }
     });
     *shared.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
-    if shared.lifecycle.apply(LifecycleEvent::Bound).is_err() {
-        // Shutdown won the race. Stop the new task too.
+    if let Err(state) = shared.lifecycle.apply(LifecycleEvent::Bound) {
+        // A shutdown came during start. Stop the new server too.
         shared.stop.cancel();
+        return Err(GrpcError::NotIdle(state));
     }
-    shared.metrics.set_up(shared.lifecycle.get().is_ready());
     Ok(local_addr)
 }
+
+/// Applies `ServerExited` when the server task ends, also on a panic.
+struct ExitGuard(Arc<Shared>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if self.0.lifecycle.apply(LifecycleEvent::ServerExited) == Ok(Lifecycle::Failed) {
+            tracing::error!("gRPC server stopped unexpectedly");
+            self.0.mark_stopped();
+        }
+    }
+}
+
+/// Follow Autumn's readiness. When Autumn starts to shut down (or an
+/// operator drains it), report `NOT_SERVING` at once, so load balancers
+/// stop new calls before the drain. Report `SERVING` again if readiness
+/// comes back.
+pub fn watch_readiness(shared: &Arc<Shared>, state: AppState) {
+    if shared.health.get().is_none() {
+        return;
+    }
+    let shared = shared.clone();
+    let stop = shared.stop.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(READINESS_POLL);
+        let mut draining = false;
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            let now = state.probes().is_shutting_down();
+            if now != draining {
+                draining = now;
+                let status = if now {
+                    ServingStatus::NotServing
+                } else {
+                    ServingStatus::Serving
+                };
+                shared.set_health(status).await;
+            }
+        }
+    });
+}
+
+/// How often the plugin reads Autumn's readiness.
+const READINESS_POLL: Duration = Duration::from_millis(250);
 
 /// Bind without awaiting, so a caller that cannot drive the reactor
 /// (for example `TestApp` hooks) does not block.
@@ -307,26 +353,73 @@ fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::from_std(listener)
 }
 
-pin_project_lite::pin_project! {
-    /// Ends the accept stream, and drops the listener, when `stop` fires.
-    struct StopOnCancel<S> {
-        inner: Option<S>,
-        #[pin]
-        stop: Pin<Box<WaitForCancellationFutureOwned>>,
+/// The accept stream.
+///
+/// - A task drops the listener when `stop` fires. tonic stops polling this
+///   stream at that time, so the stream cannot do it itself. New clients
+///   then get "connection refused" during the drain.
+/// - With a connection limit, it takes a permit before each accept. The
+///   connection keeps the permit until it closes.
+struct Accept {
+    listener: Arc<Mutex<Option<TcpIncoming>>>,
+    permits: Option<PollSemaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+    kill: CancellationToken,
+}
+
+impl Accept {
+    fn new(listener: tokio::net::TcpListener, config: &GrpcConfig, shared: &Shared) -> Self {
+        let listener = Arc::new(Mutex::new(Some(
+            TcpIncoming::from(listener)
+                .with_nodelay(Some(config.tcp_nodelay))
+                .with_keepalive(config.tcp_keepalive()),
+        )));
+        let slot = listener.clone();
+        let stop = shared.stop.clone();
+        tokio::spawn(async move {
+            stop.cancelled().await;
+            let closed = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+            drop(closed);
+        });
+        Self {
+            listener,
+            permits: (config.max_connections > 0)
+                .then(|| PollSemaphore::new(Arc::new(Semaphore::new(config.max_connections)))),
+            permit: None,
+            kill: shared.kill.clone(),
+        }
     }
 }
 
-impl<S: Stream + Unpin> Stream for StopOnCancel<S> {
-    type Item = S::Item;
+impl Stream for Accept {
+    type Item = std::io::Result<Killable>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        if this.stop.poll(cx).is_ready() {
-            *this.inner = None;
+        let this = self.get_mut();
+        if this.permit.is_none()
+            && let Some(permits) = this.permits.as_mut()
+        {
+            match permits.poll_acquire(cx) {
+                Poll::Ready(Some(permit)) => this.permit = Some(permit),
+                // The semaphore never closes. Treat a close as the end.
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        this.inner
-            .as_mut()
-            .map_or(Poll::Ready(None), |inner| inner.poll_next_unpin(cx))
+        let mut listener = this.listener.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(incoming) = listener.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match incoming.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(stream))) => Poll::Ready(Some(Ok(Killable::new(
+                stream,
+                &this.kill,
+                this.permit.take(),
+            )))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -335,13 +428,22 @@ impl<S: Stream + Unpin> Stream for StopOnCancel<S> {
 struct Killable {
     inner: TcpStream,
     kill: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// Held until the connection closes (connection limit).
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Killable {
-    fn new(inner: TcpStream, kill: CancellationToken) -> Self {
+    /// A child token per connection keeps the lock of each poll local to
+    /// that connection.
+    fn new(
+        inner: TcpStream,
+        kill: &CancellationToken,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         Self {
             inner,
-            kill: Box::pin(kill.cancelled_owned()),
+            kill: Box::pin(kill.child_token().cancelled_owned()),
+            _permit: permit,
         }
     }
 
@@ -402,5 +504,46 @@ impl Connected for Killable {
 
     fn connect_info(&self) -> Self::ConnectInfo {
         self.inner.connect_info()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_task_that_ends_while_serving_fails_and_releases_waiters() {
+        let shared = Arc::new(Shared::new());
+        shared.lifecycle.apply(LifecycleEvent::Bound).unwrap();
+        let stopped = shared.stopped.subscribe();
+        drop(ExitGuard(shared.clone()));
+        assert_eq!(shared.lifecycle.get(), Lifecycle::Failed);
+        assert!(*stopped.borrow(), "waiters are released");
+    }
+
+    #[test]
+    fn a_server_task_that_ends_while_draining_stops() {
+        let shared = Arc::new(Shared::new());
+        shared.lifecycle.apply(LifecycleEvent::Bound).unwrap();
+        shared
+            .lifecycle
+            .apply(LifecycleEvent::ShutdownRequested)
+            .unwrap();
+        drop(ExitGuard(shared.clone()));
+        assert_eq!(shared.lifecycle.get(), Lifecycle::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_server_task_still_fails_the_lifecycle() {
+        let shared = Arc::new(Shared::new());
+        shared.lifecycle.apply(LifecycleEvent::Bound).unwrap();
+        let exit = ExitGuard(shared.clone());
+        let task = tokio::spawn(async move {
+            let _exit = exit;
+            panic!("server task panics");
+        });
+        assert!(task.await.is_err());
+        assert_eq!(shared.lifecycle.get(), Lifecycle::Failed);
     }
 }

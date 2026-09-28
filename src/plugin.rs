@@ -17,9 +17,10 @@ use tower::{Layer, Service};
 
 use crate::config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved};
 use crate::error::GrpcError;
-use crate::health::{GrpcHealthIndicator, GrpcMetricsSource};
+use crate::health::GrpcHealthIndicator;
 use crate::lifecycle::LifecycleEvent;
 use crate::metrics::MetricsLayer;
+use crate::registry::{GrpcServers, ServersMetrics};
 use crate::server::{GrpcHandle, Launch, Shared};
 
 /// The name in `Plugin::name`, logs and errors.
@@ -36,6 +37,17 @@ const REFLECTION_V1ALPHA: &str = "grpc.reflection.v1alpha.ServerReflection";
 type Registration = Box<dyn FnOnce(&AppState, Routes) -> Routes + Send>;
 type RouterLayer = Box<dyn FnOnce(axum::Router) -> axum::Router + Send>;
 type Override = Arc<dyn Fn(&mut GrpcConfig) + Send + Sync>;
+
+/// How `autumn routes` classifies user services.
+#[derive(Debug, Clone)]
+enum Posture {
+    /// No declaration. `autumn routes audit` fails on it.
+    Unclassified,
+    /// Declared open with [`GrpcPlugin::public`].
+    Public,
+    /// Behind a guard. The label names it.
+    Gated(String),
+}
 
 /// Work that the startup hook does once.
 struct Pending {
@@ -83,7 +95,7 @@ pub struct GrpcPlugin {
     service_names: Vec<&'static str>,
     layers: Vec<RouterLayer>,
     descriptors: Vec<&'static [u8]>,
-    gated: Option<String>,
+    posture: Posture,
     shared: Arc<Shared>,
 }
 
@@ -116,7 +128,7 @@ impl GrpcPlugin {
             service_names: Vec::new(),
             layers: Vec::new(),
             descriptors: Vec::new(),
-            gated: None,
+            posture: Posture::Unclassified,
             shared: Arc::new(Shared::new()),
         }
     }
@@ -175,9 +187,9 @@ impl GrpcPlugin {
         self
     }
 
-    /// Wrap every user service with a tower layer (for example auth or rate
-    /// limits). The health and reflection services are not wrapped, so
-    /// probes and tools still work.
+    /// Wrap every user service with a tower layer (for example rate limits
+    /// or tracing). The layer does not wrap health or reflection, so probes
+    /// and tools still work. For an auth layer, use [`guard`](Self::guard).
     ///
     /// Layers apply in call order: the last layer is the outermost.
     #[must_use]
@@ -195,14 +207,13 @@ impl GrpcPlugin {
     }
 
     /// Run a tonic interceptor before every user call. Like
-    /// [`layer`](Self::layer), it does not wrap health or reflection.
+    /// [`layer`](Self::layer), it does not wrap health or reflection. For an
+    /// auth interceptor, use [`guard_interceptor`](Self::guard_interceptor).
     ///
     /// ```rust,ignore
-    /// GrpcPlugin::new().interceptor(|request: tonic::Request<()>| {
-    ///     match request.metadata().get("authorization") {
-    ///         Some(token) if token == "Bearer secret" => Ok(request),
-    ///         _ => Err(tonic::Status::unauthenticated("token required")),
-    ///     }
+    /// GrpcPlugin::new().interceptor(|mut request: tonic::Request<()>| {
+    ///     request.extensions_mut().insert(RequestStart(Instant::now()));
+    ///     Ok(request)
     /// })
     /// ```
     #[must_use]
@@ -213,13 +224,38 @@ impl GrpcPlugin {
         self.layer(tonic::service::InterceptorLayer::new(interceptor))
     }
 
-    /// Mark user services as gated in `autumn routes`, with `label` as the
-    /// middleware name. Call it when a [`layer`](Self::layer) or
-    /// [`interceptor`](Self::interceptor) checks auth. Without it, the
-    /// listing shows the services as public.
+    /// Guard every user service with `layer`, for example an auth layer.
+    /// `autumn routes` then shows the services as gated, with `label` as
+    /// the middleware name.
     #[must_use]
-    pub fn gated(mut self, label: impl Into<String>) -> Self {
-        self.gated = Some(label.into());
+    pub fn guard<L>(mut self, layer: L, label: impl Into<String>) -> Self
+    where
+        L: Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: Service<axum::extract::Request> + Clone + Send + Sync + 'static,
+        <L::Service as Service<axum::extract::Request>>::Response: IntoResponse + 'static,
+        <L::Service as Service<axum::extract::Request>>::Error: Into<Infallible> + 'static,
+        <L::Service as Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.posture = Posture::Gated(label.into());
+        self.layer(layer)
+    }
+
+    /// Guard every user service with a tonic interceptor. Like
+    /// [`guard`](Self::guard), with an interceptor in place of a layer.
+    #[must_use]
+    pub fn guard_interceptor<F>(self, interceptor: F, label: impl Into<String>) -> Self
+    where
+        F: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+    {
+        self.guard(tonic::service::InterceptorLayer::new(interceptor), label)
+    }
+
+    /// Declare the user services open to all clients. `autumn routes` then
+    /// shows them as public. Without `guard*` or `public`, the services are
+    /// unclassified, and `autumn routes audit` fails.
+    #[must_use]
+    pub fn public(mut self) -> Self {
+        self.posture = Posture::Public;
         self
     }
 
@@ -235,19 +271,28 @@ impl GrpcPlugin {
         if !config.enabled {
             return Vec::new();
         }
-        let gated = self.gated.as_deref();
+        let (classification, middleware) = match &self.posture {
+            Posture::Unclassified => (RouteClassification::Unclassified, None),
+            Posture::Public => (RouteClassification::Public, None),
+            Posture::Gated(label) => (RouteClassification::Gated, Some(label.as_str())),
+        };
         let mut routes: Vec<RouteInfo> = self
             .service_names
             .iter()
-            .map(|name| grpc_route(name, gated))
+            .map(|name| grpc_route(name, classification, middleware))
             .collect();
+        let mut framework = Vec::new();
         if config.health {
-            routes.push(grpc_route(HEALTH_SERVICE, None));
+            framework.push(HEALTH_SERVICE);
         }
         if config.reflection.resolve(resolved.is_development()) {
-            routes.push(grpc_route(REFLECTION_V1, None));
-            routes.push(grpc_route(REFLECTION_V1ALPHA, None));
+            framework.extend([REFLECTION_V1, REFLECTION_V1ALPHA]);
         }
+        routes.extend(
+            framework
+                .into_iter()
+                .map(|name| grpc_route(name, RouteClassification::Framework, None)),
+        );
         routes
     }
 
@@ -272,9 +317,9 @@ impl GrpcPlugin {
         self
     }
 
-    /// Read a different section than `[grpc]`. The env prefix follows:
-    /// `grpc_admin` reads `AUTUMN_GRPC_ADMIN__*`. Use this to run two
-    /// servers.
+    /// Read a different section than `[grpc]`. The environment prefix
+    /// changes with the section: `grpc_admin` reads `AUTUMN_GRPC_ADMIN__*`.
+    /// Use this to run two servers.
     #[must_use]
     pub fn config_section(mut self, section: impl Into<String>) -> Self {
         self.section = section.into();
@@ -306,8 +351,8 @@ impl GrpcPlugin {
 
     /// Names of the services added with `add_service*`.
     #[must_use]
-    pub fn service_names(&self) -> Vec<&'static str> {
-        self.service_names.clone()
+    pub fn service_names(&self) -> &[&'static str] {
+        &self.service_names
     }
 
     /// The configuration after files, environment and code.
@@ -337,20 +382,49 @@ impl GrpcPlugin {
     }
 }
 
-fn grpc_route(service: &str, gated: Option<&str>) -> RouteInfo {
+fn grpc_route(
+    service: &str,
+    classification: RouteClassification,
+    middleware: Option<&str>,
+) -> RouteInfo {
     RouteInfo {
         method: "GRPC".to_owned(),
         path: format!("/{service}/*"),
         handler: format!("autumn_plugin_grpc::{service}"),
-        classification: gated.map_or(RouteClassification::Public, |_| RouteClassification::Gated),
-        middleware: gated.map(str::to_owned).into_iter().collect(),
+        classification,
+        middleware: middleware.map(str::to_owned).into_iter().collect(),
         ..RouteInfo::default()
     }
 }
 
-/// User services, wrapped by the user layers. axum applies a layer only to
-/// the routes that exist when `layer` is called, so services added later
-/// (health, reflection) are not wrapped.
+/// Largest request the health and reflection services decode. Their
+/// requests are small, and no user layer guards them.
+const PLUGIN_SERVICE_MAX_MESSAGE: usize = 16 * 1024;
+
+/// axum panics on a duplicate route. Return an error first.
+fn check_unique(
+    user_names: &[&'static str],
+    config: &GrpcConfig,
+    development: bool,
+) -> Result<(), GrpcError> {
+    let mut taken: HashSet<&str> = HashSet::new();
+    if config.health {
+        taken.insert(HEALTH_SERVICE);
+    }
+    if config.reflection.resolve(development) {
+        taken.extend([REFLECTION_V1, REFLECTION_V1ALPHA]);
+    }
+    for name in user_names {
+        if !taken.insert(name) {
+            return Err(GrpcError::DuplicateService((*name).to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// User services, in the user layers. axum applies a layer only to the
+/// routes that exist at the `layer` call. The plugin adds health and
+/// reflection after that call, so the user layers do not wrap them.
 fn user_routes(
     state: &AppState,
     registrations: Vec<Registration>,
@@ -384,8 +458,14 @@ fn add_reflection(
         })
     };
     let invalid = |e: tonic_reflection::server::Error| GrpcError::Reflection(e.to_string());
-    let v1 = configure().build_v1().map_err(invalid)?;
-    let v1alpha = configure().build_v1alpha().map_err(invalid)?;
+    let v1 = configure()
+        .build_v1()
+        .map_err(invalid)?
+        .max_decoding_message_size(PLUGIN_SERVICE_MAX_MESSAGE);
+    let v1alpha = configure()
+        .build_v1alpha()
+        .map_err(invalid)?
+        .max_decoding_message_size(PLUGIN_SERVICE_MAX_MESSAGE);
     Ok(routes.add_service(v1).add_service(v1alpha))
 }
 
@@ -404,11 +484,13 @@ fn build_routes(
         layers,
         descriptors,
     } = pending;
+    check_unique(user_names, config, development)?;
     let mut routes = user_routes(state, registrations, layers);
     let mut known: HashSet<String> = user_names.iter().map(|n| (*n).to_owned()).collect();
 
     let reporter = config.health.then(|| {
         let (reporter, service) = tonic_health::server::health_reporter();
+        let service = service.max_decoding_message_size(PLUGIN_SERVICE_MAX_MESSAGE);
         routes = std::mem::take(&mut routes).add_service(service);
         known.insert(HEALTH_SERVICE.to_owned());
         reporter
@@ -419,7 +501,21 @@ fn build_routes(
         known.insert(REFLECTION_V1ALPHA.to_owned());
     }
 
-    shared.metrics.configure(config.max_metric_series, known);
+    let mut sets = descriptors.clone();
+    if config.health {
+        sets.push(tonic_health::pb::FILE_DESCRIPTOR_SET);
+    }
+    let mut methods = crate::metrics::methods_from_descriptors(&sets);
+    // The reflection services each have one method.
+    for name in [REFLECTION_V1, REFLECTION_V1ALPHA] {
+        methods.insert(
+            name.to_owned(),
+            HashSet::from(["ServerReflectionInfo".to_owned()]),
+        );
+    }
+    shared
+        .metrics
+        .configure(config.max_metric_series, known, methods);
     let with_state = routes
         .into_axum_router()
         .layer(axum::Extension(state.clone()));
@@ -432,8 +528,7 @@ fn build_routes(
 }
 
 impl Plugin for GrpcPlugin {
-    /// Keyed by config section, so two servers can run with different
-    /// sections.
+    /// The name contains the config section. Two servers need two sections.
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(format!("{PLUGIN_NAME}@{}", self.section))
     }
@@ -452,7 +547,8 @@ impl Plugin for GrpcPlugin {
                 let error = error.clone();
                 let shared = shared.clone();
                 async move {
-                    let _ = shared.lifecycle.apply(LifecycleEvent::BindFailed);
+                    let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
+                    shared.mark_stopped();
                     Err(startup_error(&GrpcError::Config(error)))
                 }
             });
@@ -470,12 +566,24 @@ impl Plugin for GrpcPlugin {
         let user_names = self.service_names.clone();
         let section = self.section.clone();
         let declared = self.route_infos();
+        let existing = app.extension::<GrpcServers>().cloned();
+        let first_server = existing.is_none();
+        let servers = existing.unwrap_or_default();
+        let app = if first_server {
+            app.with_extension(servers.clone())
+        } else {
+            app
+        };
+        servers.insert(section.clone(), GrpcHandle::new(shared.clone()));
+        let hook_servers = servers.clone();
+        let is_default = section == DEFAULT_SECTION;
         let hook_shared = shared.clone();
         let app = app.on_startup(move |state| {
             let pending = pending.clone();
             let shared = hook_shared.clone();
             let config = config.clone();
             let user_names = user_names.clone();
+            let servers = hook_servers.clone();
             async move {
                 let taken = pending
                     .lock()
@@ -490,29 +598,31 @@ impl Plugin for GrpcPlugin {
                 match result {
                     Ok(addr) => {
                         tracing::info!(%addr, services = ?user_names, "gRPC server listening");
-                        state.insert_extension(GrpcHandle::new(shared));
+                        state.insert_extension(servers);
+                        if is_default {
+                            state.insert_extension(GrpcHandle::new(shared));
+                        }
                         Ok(())
                     }
                     Err(error) => {
-                        let _ = shared.lifecycle.apply(LifecycleEvent::BindFailed);
+                        let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
+                        shared.mark_stopped();
                         Err(startup_error(&error))
                     }
                 }
             }
         });
 
+        // Autumn keeps one family per metric name, so one source reports
+        // every server.
+        let app = if first_server {
+            app.metrics_source(PLUGIN_NAME, Arc::new(ServersMetrics(servers)))
+        } else {
+            app
+        };
         let stop_shared = shared.clone();
         app.declare_plugin_routes(declared)
-            .health_indicator(
-                section.clone(),
-                Arc::new(GrpcHealthIndicator {
-                    shared: shared.clone(),
-                }),
-            )
-            .metrics_source(
-                format!("{PLUGIN_NAME}@{section}"),
-                Arc::new(GrpcMetricsSource { shared }),
-            )
+            .health_indicator(section, Arc::new(GrpcHealthIndicator { shared }))
             .on_shutdown(move || {
                 let handle = GrpcHandle::new(stop_shared.clone());
                 async move { handle.shutdown().await }
@@ -521,21 +631,38 @@ impl Plugin for GrpcPlugin {
 }
 
 /// Autumn runs plugin shutdown hooks after the HTTP drain, inside
-/// `server.shutdown_timeout_secs`. A longer gRPC grace would be cut off, so
-/// cap it.
+/// `server.shutdown_timeout_secs`. Autumn stops a hook that runs longer.
+/// The plugin caps the grace, and keeps time to close killed connections.
 fn fit_grace_to_autumn(config: &mut GrpcConfig, state: &AppState) {
     let budget_ms = state
         .config_arc()
         .server
         .shutdown_timeout_secs
         .saturating_mul(1000);
-    if budget_ms > 0 && config.shutdown_grace_ms > budget_ms {
+    // Leave time to close killed connections, inside the same budget.
+    let kill_ms = u64::try_from(crate::server::KILL_WAIT.as_millis()).unwrap_or(u64::MAX);
+    let limit = budget_ms.saturating_sub(kill_ms.min(budget_ms / 2)).max(1);
+    if config.shutdown_grace_ms > limit {
         tracing::warn!(
             shutdown_grace_ms = config.shutdown_grace_ms,
-            budget_ms,
-            "gRPC shutdown_grace_ms is longer than server.shutdown_timeout_secs; using the shorter value"
+            limit_ms = limit,
+            "gRPC shutdown_grace_ms does not fit in server.shutdown_timeout_secs; using the limit"
         );
-        config.shutdown_grace_ms = budget_ms;
+        config.shutdown_grace_ms = limit;
+    }
+}
+
+/// Reflection shows the full API. Warn when it is on and the listener
+/// accepts calls from other hosts.
+fn warn_on_open_reflection(config: &GrpcConfig, development: bool) {
+    let open = config
+        .bind_addr(development)
+        .is_ok_and(|addr| !addr.ip().is_loopback());
+    if open && config.reflection.resolve(development) {
+        tracing::warn!(
+            bind = %config.bind,
+            "gRPC reflection is on and the listener is not on loopback; set `reflection = false` to hide the API"
+        );
     }
 }
 
@@ -554,12 +681,14 @@ async fn launch(
     crate::tls::server_config(&config.tls)?;
 
     fit_grace_to_autumn(&mut config, state);
+    warn_on_open_reflection(&config, development);
     let (routes, health) = build_routes(state, pending, &config, development, shared, user_names)?;
     let health_names = user_names.iter().map(|n| (*n).to_owned()).collect();
-    crate::server::start(
+    let addr = crate::server::start(
         shared,
         Launch {
             config,
+            development,
             routes,
             health,
             health_names,
@@ -567,7 +696,9 @@ async fn launch(
             tls,
         },
     )
-    .await
+    .await?;
+    crate::server::watch_readiness(shared, state.clone());
+    Ok(addr)
 }
 
 fn startup_error(error: &GrpcError) -> autumn_web::AutumnError {

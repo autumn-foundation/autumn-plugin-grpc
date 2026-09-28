@@ -27,13 +27,16 @@ use std::time::Duration;
 use autumn_web::config::Env;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// The default gRPC port.
+pub const DEFAULT_PORT: u16 = 50051;
+
 /// The default config section.
 pub const DEFAULT_SECTION: &str = "grpc";
 
 /// A three-state switch. In TOML, write a boolean or `"auto"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Toggle {
-    /// The context decides. See each field.
+    /// The active profile decides. Each field gives the rule.
     #[default]
     Auto,
     /// Always on.
@@ -104,50 +107,65 @@ impl<'de> Deserialize<'de> for Toggle {
 
 /// Settings for one gRPC server.
 ///
-/// For each `*_ms` duration, `0` means "not set" (the tonic default).
+/// The defaults limit resource use. For a setting that says "`0`: off",
+/// the value `0` removes that limit or feature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 #[allow(clippy::struct_excessive_bools)] // independent switches, as in TOML
 pub struct GrpcConfig {
     /// Start the server. Default: `true`.
     pub enabled: bool,
-    /// Listen address, `IP:port`. Port `0` picks a free port.
-    /// Default: `"0.0.0.0:50051"`.
+    /// Listen address, `IP:port`. Port `0` picks a free port. Empty: the
+    /// profile decides. `dev` and `test` use `127.0.0.1:50051`. Other
+    /// profiles use `0.0.0.0:50051`. Default: empty.
     pub bind: String,
     /// Serve `grpc.health.v1.Health`. Default: `true`.
     pub health: bool,
-    /// Serve server reflection. `auto` is on in `dev`/`test` only.
+    /// Serve server reflection. `auto` is on in `dev` and `test` only.
     pub reflection: Toggle,
     /// Record `grpc_server_*` metrics. Default: `true`.
     pub metrics: bool,
-    /// Maximum label sets per metric. Extra calls count as `other`.
-    /// Default: `1000`.
+    /// Maximum label sets per metric. The plugin counts new label sets
+    /// over this limit as `other`. Default: `1000`.
     pub max_metric_series: usize,
-    /// Time for in-flight calls to finish at shutdown. Default: `10000`.
+    /// Time for in-flight calls to finish at shutdown. Must be more than
+    /// `0`. Default: `10000`.
     pub shutdown_grace_ms: u64,
-    /// Per-call timeout. Default: `0` (none).
+    /// Per-call timeout for unary calls. `0`: off. Default: `0`.
     pub timeout_ms: u64,
-    /// Concurrent calls per connection. Default: `0` (no limit).
+    /// Open connections. The listener waits when it reaches the limit.
+    /// `0`: off. Default: `1000`.
+    pub max_connections: usize,
+    /// Concurrent calls per connection. A streaming call counts until its
+    /// response starts. `0`: off. Default: `0`.
     pub concurrency_limit_per_connection: usize,
-    /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. Default: `0` (hyper default).
+    /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. Must be more than `0`.
+    /// Default: `200`.
     pub max_concurrent_streams: u32,
+    /// Server-side stream resets per connection before the server closes
+    /// it (a protection against reset floods). Must be more than `0`.
+    /// Default: `1024`.
+    pub http2_max_local_error_reset_streams: usize,
     /// Set `TCP_NODELAY`. Default: `true`.
     pub tcp_nodelay: bool,
-    /// TCP keepalive idle time. Default: `0` (off).
+    /// TCP keepalive idle time. `0`: off. Default: `0`.
     pub tcp_keepalive_ms: u64,
-    /// HTTP/2 PING interval. Default: `0` (off).
+    /// HTTP/2 PING interval. `0`: off. Default: `60000`.
     pub http2_keepalive_interval_ms: u64,
-    /// HTTP/2 PING ack timeout. Default: `0` (tonic default, 20 s).
+    /// Time to wait for a PING reply. `0`: tonic default (20 s).
+    /// Default: `20000`.
     pub http2_keepalive_timeout_ms: u64,
-    /// Close connections after this age. Default: `0` (never).
+    /// Close connections after this age. `0`: off. Default: `0`.
     pub max_connection_age_ms: u64,
     /// TLS settings. Empty paths mean plain text.
     pub tls: TlsConfig,
 }
 
 /// TLS settings. Needs the `tls` crate feature.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct TlsConfig {
     /// PEM certificate chain of the server.
     pub cert_path: String,
@@ -156,7 +174,23 @@ pub struct TlsConfig {
     /// PEM CA bundle. When set, clients must show a certificate (mTLS).
     pub client_ca_path: String,
     /// With `client_ca_path`, also accept clients without a certificate.
+    /// Your interceptor must then check `request.peer_certs()`.
     pub client_auth_optional: bool,
+    /// Time for a client to finish the TLS handshake. Must be more than
+    /// `0`. Default: `10000`.
+    pub handshake_timeout_ms: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_ca_path: String::new(),
+            client_auth_optional: false,
+            handshake_timeout_ms: 10_000,
+        }
+    }
 }
 
 impl TlsConfig {
@@ -165,25 +199,33 @@ impl TlsConfig {
     pub fn is_enabled(&self) -> bool {
         !self.cert_path.trim().is_empty()
     }
+
+    /// TLS handshake timeout.
+    #[must_use]
+    pub const fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms)
+    }
 }
 
 impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            bind: "0.0.0.0:50051".to_owned(),
+            bind: String::new(),
             health: true,
             reflection: Toggle::Auto,
             metrics: true,
             max_metric_series: 1000,
             shutdown_grace_ms: 10_000,
             timeout_ms: 0,
+            max_connections: 1000,
             concurrency_limit_per_connection: 0,
-            max_concurrent_streams: 0,
+            max_concurrent_streams: 200,
+            http2_max_local_error_reset_streams: 1024,
             tcp_nodelay: true,
             tcp_keepalive_ms: 0,
-            http2_keepalive_interval_ms: 0,
-            http2_keepalive_timeout_ms: 0,
+            http2_keepalive_interval_ms: 60_000,
+            http2_keepalive_timeout_ms: 20_000,
             max_connection_age_ms: 0,
             tls: TlsConfig::default(),
         }
@@ -194,22 +236,39 @@ impl Default for GrpcConfig {
 /// defaults.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid gRPC configuration: {0}")]
-pub struct ConfigError(pub String);
+pub struct ConfigError(String);
+
+impl ConfigError {
+    /// The problem, without the prefix.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A resolved configuration and the active profile.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    /// The merged, validated configuration.
-    pub config: GrpcConfig,
-    /// The canonical active profile (`dev`, `prod`, `test`, ...).
-    pub profile: String,
+    pub(crate) config: GrpcConfig,
+    pub(crate) profile: String,
 }
 
 impl Resolved {
+    /// The merged, validated configuration.
+    #[must_use]
+    pub const fn config(&self) -> &GrpcConfig {
+        &self.config
+    }
+
+    /// The canonical active profile, for example `dev`, `prod` or `test`.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
     /// Configuration from code. The plugin reads no files. The profile
     /// still comes from the environment.
-    #[must_use]
-    pub fn explicit(config: GrpcConfig) -> Self {
+    pub(crate) fn explicit(config: GrpcConfig) -> Self {
         let profile = autumn_web::dotenv::os_env_with_dotenv().map_or_else(
             |_| resolve_active_profile(&autumn_web::config::OsEnv).1,
             |env| resolve_active_profile(&env).1,
@@ -233,13 +292,23 @@ const fn millis(ms: u64) -> Option<Duration> {
 }
 
 impl GrpcConfig {
-    /// The parsed listen address.
+    /// The listen address. An empty `bind` gives `127.0.0.1:50051` in
+    /// development and `0.0.0.0:50051` in other profiles.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when `bind` is not `IP:port`.
-    pub fn bind_addr(&self) -> Result<SocketAddr, ConfigError> {
-        self.bind.trim().parse().map_err(|_| {
+    pub fn bind_addr(&self, development: bool) -> Result<SocketAddr, ConfigError> {
+        let bind = self.bind.trim();
+        if bind.is_empty() {
+            let host = if development {
+                [127, 0, 0, 1]
+            } else {
+                [0, 0, 0, 0]
+            };
+            return Ok(SocketAddr::from((host, DEFAULT_PORT)));
+        }
+        bind.parse().map_err(|_| {
             ConfigError(format!(
                 "`bind` must be IP:port (for example \"0.0.0.0:50051\"), found \"{}\"",
                 self.bind
@@ -316,10 +385,9 @@ impl GrpcConfig {
     /// Returns [`ConfigError`] when a file cannot be read or parsed, or when
     /// the merged section is not valid.
     pub fn resolve(section: &str) -> Result<Resolved, ConfigError> {
-        autumn_web::dotenv::os_env_with_dotenv().map_or_else(
-            |_| Self::resolve_with_env(section, &autumn_web::config::OsEnv),
-            |env| Self::resolve_with_env(section, &env),
-        )
+        let env = autumn_web::dotenv::os_env_with_dotenv()
+            .map_err(|e| ConfigError(format!("cannot read .env files: {e}")))?;
+        Self::resolve_with_env(section, &env)
     }
 
     /// Like [`resolve`](Self::resolve), but reads only `env`.
@@ -355,7 +423,7 @@ impl GrpcConfig {
             return Err(ConfigError(format!("`{section}` must be a table")));
         }
         let mut config = Self::from_section(Some(&section_value))?;
-        apply_env_overrides(section, &mut section_value, &mut config, env);
+        apply_env_overrides(section, &mut section_value, &mut config, env)?;
         config.validate()?;
         Ok(Resolved {
             config,
@@ -369,16 +437,23 @@ impl GrpcConfig {
     ///
     /// Returns [`ConfigError`] that names the bad key.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.bind_addr()?;
-        if self.shutdown_grace_ms == 0 {
-            return Err(ConfigError(
-                "`shutdown_grace_ms` must be greater than 0".to_owned(),
-            ));
-        }
-        if self.max_metric_series == 0 {
-            return Err(ConfigError(
-                "`max_metric_series` must be greater than 0".to_owned(),
-            ));
+        self.bind_addr(true)?;
+        for (key, value) in [
+            ("shutdown_grace_ms", self.shutdown_grace_ms),
+            ("max_metric_series", self.max_metric_series as u64),
+            (
+                "max_concurrent_streams",
+                u64::from(self.max_concurrent_streams),
+            ),
+            (
+                "http2_max_local_error_reset_streams",
+                self.http2_max_local_error_reset_streams as u64,
+            ),
+            ("tls.handshake_timeout_ms", self.tls.handshake_timeout_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError(format!("`{key}` must be more than 0")));
+            }
         }
         let tls = &self.tls;
         let has = |value: &str| !value.trim().is_empty();
@@ -400,29 +475,33 @@ impl GrpcConfig {
                 "`tls.client_ca_path` needs `tls.cert_path` and `tls.key_path`".to_owned(),
             ));
         }
+        if tls.client_auth_optional && !has(&tls.client_ca_path) {
+            return Err(ConfigError(
+                "`tls.client_auth_optional` needs `tls.client_ca_path`".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
 
 /// The env prefix for a section: `grpc` → `AUTUMN_GRPC__`.
-#[must_use]
-pub fn env_prefix(section: &str) -> String {
+fn env_prefix(section: &str) -> String {
     format!("AUTUMN_{}__", section.to_ascii_uppercase())
 }
 
 /// Apply `AUTUMN_<SECTION>__<PATH>` overrides for each known leaf key.
 ///
 /// Values are TOML literals (`true`, `10`, `"x"`) or bare strings. An
-/// override that does not type-check is logged and ignored, as in core.
+/// override with the wrong type is an error: a bad value must not leave a
+/// file value (for example `reflection = true`) in place.
 fn apply_env_overrides(
     section_name: &str,
     section: &mut toml::Value,
     config: &mut GrpcConfig,
     env: &dyn Env,
-) {
-    let Ok(defaults) = toml::Value::try_from(GrpcConfig::default()) else {
-        return;
-    };
+) -> Result<(), ConfigError> {
+    let defaults =
+        toml::Value::try_from(GrpcConfig::default()).map_err(|e| ConfigError(e.to_string()))?;
     let prefix = env_prefix(section_name);
     let mut leaves = Vec::new();
     collect_leaves(&defaults, &mut Vec::new(), &mut leaves);
@@ -439,18 +518,11 @@ fn apply_env_overrides(
         };
         let mut candidate = section.clone();
         set_path(&mut candidate, &path, parse_env_value(&raw));
-        match GrpcConfig::from_section(Some(&candidate)) {
-            Ok(parsed) => {
-                *section = candidate;
-                *config = parsed;
-            }
-            Err(error) => tracing::warn!(
-                variable = %key,
-                %error,
-                "ignoring a gRPC environment override that does not type-check"
-            ),
-        }
+        *config = GrpcConfig::from_section(Some(&candidate))
+            .map_err(|error| ConfigError(format!("{key}: {}", error.message())))?;
+        *section = candidate;
     }
+    Ok(())
 }
 
 fn parse_env_value(raw: &str) -> toml::Value {

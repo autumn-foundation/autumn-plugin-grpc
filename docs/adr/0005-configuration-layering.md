@@ -14,10 +14,14 @@ the plugin reads only the base file, `[profile.prod.grpc]` has no effect.
   `autumn-<profile>.toml`, then `AUTUMN_<SECTION>__*` env variables.
 - `deny_unknown_fields`, and `validate()` for values. An error stops boot
   from the startup hook.
-- A bad env override is logged and ignored, as in core.
+- A bad env override stops boot. Core logs and ignores it, but a bad
+  value must not leave a weaker file value in place (for example
+  `AUTUMN_GRPC__REFLECTION=0` must not keep `reflection = true`).
+- An unreadable `.env` file stops boot.
 - `[grpc.tls]` without the `tls` feature stops boot. No silent plain text.
-- The grace period is capped by `server.shutdown_timeout_secs`, because
-  Autumn runs plugin hooks inside that budget.
+- `server.shutdown_timeout_secs` caps the grace period, because Autumn
+  runs plugin hooks inside that budget. The cap keeps 1 s (or half the
+  budget, if less) to close killed connections.
 
 ## Consequences
 

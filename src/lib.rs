@@ -34,15 +34,15 @@ mod health;
 mod lifecycle;
 mod metrics;
 mod plugin;
+mod registry;
 mod server;
 mod tls;
 
-pub use config::{
-    ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved, TlsConfig, Toggle, env_prefix,
-};
+pub use config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved, TlsConfig, Toggle};
 pub use error::GrpcError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 pub use plugin::{GrpcPlugin, PLUGIN_NAME, SUPPORTED_AUTUMN_WEB};
+pub use registry::GrpcServers;
 pub use server::GrpcHandle;
 
 /// Re-exports, so apps use the same tonic version as the plugin.

@@ -87,13 +87,13 @@ async fn main() {
                 .add_service(pb::echo_server::EchoServer::new(EchoService))
                 .file_descriptor_set(DESCRIPTOR)
                 // Demo auth. Health and reflection are not behind it.
-                .interceptor(
+                .guard_interceptor(
                     |request: Request<()>| match request.metadata().get("authorization") {
                         Some(token) if token == "Bearer demo" => Ok(request),
                         _ => Err(Status::unauthenticated("send `authorization: Bearer demo`")),
                     },
-                )
-                .gated("bearer token"),
+                    "bearer token",
+                ),
         )
         .run()
         .await;

@@ -19,8 +19,10 @@ The lifecycle has 5 states and 5 events: 25 pairs.
 - `tests/lifecycle.rs` holds the spec as a table and checks all 25 pairs.
   For a finite machine this is a complete model check.
 - Property tests check the invariants over random event sequences:
-  terminal states absorb, progress is monotonic, `Serving` comes only from
-  `Idle` + `Bound`, and the cell agrees with the pure function.
+  - No event leaves a terminal state.
+  - The state never goes back.
+  - Only `Idle` + `Bound` gives `Serving`.
+  - The cell agrees with the pure function.
 
 ## Consequences
 

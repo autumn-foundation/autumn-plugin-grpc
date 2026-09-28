@@ -7,8 +7,7 @@ use crate::error::GrpcError;
 ///
 /// # Errors
 ///
-/// [`GrpcError::Tls`] when a file cannot be read, or when TLS is set but
-/// the crate has no `tls` feature.
+/// [`GrpcError::Tls`] when a file cannot be read.
 #[cfg(feature = "tls")]
 pub fn server_config(
     config: &TlsConfig,
@@ -22,8 +21,16 @@ pub fn server_config(
         std::fs::read(path.trim()).map_err(|e| GrpcError::Tls(format!("cannot read {path}: {e}")))
     };
     let identity = Identity::from_pem(read(&config.cert_path)?, read(&config.key_path)?);
-    let mut tls = ServerTlsConfig::new().identity(identity);
+    let mut tls = ServerTlsConfig::new()
+        .identity(identity)
+        .timeout(config.handshake_timeout());
     if !config.client_ca_path.trim().is_empty() {
+        if config.client_auth_optional {
+            tracing::warn!(
+                "gRPC mTLS is optional: clients without a certificate can connect; \
+                 check `request.peer_certs()` in an interceptor"
+            );
+        }
         tls = tls
             .client_ca_root(Certificate::from_pem(read(&config.client_ca_path)?))
             .client_auth_optional(config.client_auth_optional);

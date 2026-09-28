@@ -96,11 +96,10 @@ fn async_stream(count: u32, interval_ms: u32) -> impl Stream<Item = Result<pb::T
 
 /// A config that binds a free local port and reads no files.
 pub fn local_config() -> GrpcConfig {
-    GrpcConfig {
-        bind: "127.0.0.1:0".to_owned(),
-        shutdown_grace_ms: 2_000,
-        ..GrpcConfig::default()
-    }
+    let mut config = GrpcConfig::default();
+    "127.0.0.1:0".clone_into(&mut config.bind);
+    config.shutdown_grace_ms = 2_000;
+    config
 }
 
 /// A plugin with the echo service on a free local port.
@@ -123,6 +122,39 @@ pub fn boot_with(app: TestApp, plugin: GrpcPlugin) -> (TestClient, GrpcHandle) {
     let handle = plugin.handle();
     let client = app.plugin(plugin).build();
     (client, handle)
+}
+
+/// Wait until no call is in flight, so each finished call is in the
+/// counters. The server records a call when the response body ends.
+pub async fn settle(handle: &GrpcHandle) {
+    for _ in 0..500 {
+        let idle = handle
+            .metric_families()
+            .iter()
+            .find(|f| f.name == "grpc_server_in_flight")
+            .and_then(|f| f.samples.first())
+            .is_some_and(|s| s.value == 0.0);
+        if idle {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("calls still in flight after 5 s");
+}
+
+/// Poll `check` until it is true, for at most 5 s.
+pub async fn eventually<F, Fut>(mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..100 {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// A connected channel to the handle's bound address.
