@@ -1,0 +1,29 @@
+// Test and example service for autumn-plugin-grpc.
+syntax = "proto3";
+
+package autumn.echo.v1;
+
+// Echo returns what it gets.
+service Echo {
+  // Say returns the message with an optional prefix from AppState.
+  rpc Say(SayRequest) returns (SayReply);
+  // Ticks sends `count` messages, one each `interval_ms`.
+  rpc Ticks(TicksRequest) returns (stream Tick);
+}
+
+message SayRequest {
+  string message = 1;
+}
+
+message SayReply {
+  string message = 1;
+}
+
+message TicksRequest {
+  uint32 count = 1;
+  uint32 interval_ms = 2;
+}
+
+message Tick {
+  uint32 index = 1;
+}
