@@ -7,6 +7,7 @@
 | `src/plugin.rs` | `GrpcPlugin` builder. `Plugin::build` registers hooks, the health indicator, the metrics source and the route listing. Route assembly. |
 | `src/config.rs` | `[grpc]` section: types, defaults, validation, layered resolution. |
 | `src/server.rs` | Bind, serve, drain, close. `GrpcHandle`. |
+| `src/gate.rs` | Shared listener: the `static_gate` layer on Autumn's router (ADR 0008). |
 | `src/lifecycle.rs` | Lifecycle state machine. The only way state changes. |
 | `src/metrics.rs` | Metrics layer and bounded series store. |
 | `src/health.rs` | Autumn `HealthIndicator`. |
@@ -54,6 +55,22 @@ flowchart LR
     R -->|reflection| RS[grpc.reflection]
     R -->|unknown| F[UNIMPLEMENTED]
 ```
+
+### Shared listener
+
+```mermaid
+flowchart LR
+    C[client] --> AS[Autumn server: axum::serve, h1 + h2c]
+    AS --> O[security headers, startup barrier, access log]
+    O --> G{GrpcGate}
+    G -->|HTTP/2 + application/grpc*| D[state check, call token, timeout]
+    D --> M[MetricsLayer and the routes above]
+    G -->|all other requests| H[Autumn middleware: CSRF, session, timeout, ...] --> HR[HTTP routes]
+```
+
+The gate answers `UNAVAILABLE` when the state is not `Serving`. The
+response body keeps the call token until it ends. The drain waits for the
+tokens, then ends the open bodies.
 
 User layers wrap only user services. axum applies a layer only to the
 routes that exist when the code calls `layer`. The plugin adds health and

@@ -17,12 +17,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, PollSemaphore, WaitForCancellationFutureOwned};
+use tokio_util::task::TaskTracker;
 use tonic::service::Routes;
 use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-use crate::config::GrpcConfig;
+use crate::config::{GrpcConfig, Listener};
 use crate::error::GrpcError;
 use crate::lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 use crate::metrics::Metrics;
@@ -35,12 +36,18 @@ pub struct Shared {
     /// Names reported by the health service (user services only).
     pub health_names: OnceLock<Vec<String>>,
     pub metrics: Arc<Metrics>,
+    /// The listener mode, set at start.
+    pub listener: OnceLock<Listener>,
+    /// Shared mode: the routes that the gate calls.
+    pub gate: OnceLock<crate::gate::Target>,
+    /// Shared mode: calls in flight through the gate.
+    pub calls: TaskTracker,
     grace_ms: AtomicU64,
     /// Ends the accept loop and starts tonic's graceful shutdown.
     stop: CancellationToken,
-    /// Closes every open connection. The drain uses it after the grace
-    /// period.
-    kill: CancellationToken,
+    /// Closes every open connection (dedicated) or call (shared). The
+    /// drain uses it after the grace period.
+    pub kill: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     stopped: watch::Sender<bool>,
 }
@@ -53,6 +60,9 @@ impl Shared {
             health: OnceLock::new(),
             health_names: OnceLock::new(),
             metrics: Arc::new(Metrics::new()),
+            listener: OnceLock::new(),
+            gate: OnceLock::new(),
+            calls: TaskTracker::new(),
             grace_ms: AtomicU64::new(GrpcConfig::default().shutdown_grace_ms),
             stop: CancellationToken::new(),
             kill: CancellationToken::new(),
@@ -79,6 +89,18 @@ impl Shared {
         }
     }
 
+    /// Start the drain task, once. It does not wait.
+    fn request_shutdown(self: &Arc<Self>) {
+        match self.lifecycle.apply(LifecycleEvent::ShutdownRequested) {
+            Ok(Lifecycle::Draining) => {
+                tokio::spawn(self.clone().drain());
+            }
+            // From `Idle`: nothing to drain.
+            Ok(_) => self.mark_stopped(),
+            Err(_) => {}
+        }
+    }
+
     /// The drain sequence. It runs in its own task, so it completes even
     /// when Autumn drops a shutdown hook that runs too long.
     async fn drain(self: Arc<Self>) {
@@ -98,18 +120,32 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(mut task) = task {
-            let grace = self.grace();
-            if tokio::time::timeout(grace, &mut task).await.is_err() {
-                tracing::warn!(
-                    grace_ms = grace.as_millis(),
-                    "gRPC calls still open after the grace period; closing connections"
-                );
-                self.kill.cancel();
-                if tokio::time::timeout(KILL_WAIT, &mut task).await.is_err() {
-                    task.abort();
-                }
+        let grace = self.grace();
+        if let Some(mut task) = task
+            && tokio::time::timeout(grace, &mut task).await.is_err()
+        {
+            tracing::warn!(
+                grace_ms = grace.as_millis(),
+                "gRPC calls still open after the grace period; closing connections"
+            );
+            self.kill.cancel();
+            if tokio::time::timeout(KILL_WAIT, &mut task).await.is_err() {
+                task.abort();
             }
+        }
+        // Shared mode: Autumn owns the connections. Wait for the calls, then
+        // end the ones that are still open.
+        self.calls.close();
+        if tokio::time::timeout(grace, self.calls.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                grace_ms = grace.as_millis(),
+                "gRPC calls still open after the grace period; ending them"
+            );
+            self.kill.cancel();
+            let _ = tokio::time::timeout(KILL_WAIT, self.calls.wait()).await;
         }
         let _ = self.lifecycle.apply(LifecycleEvent::Drained);
         self.mark_stopped();
@@ -151,8 +187,8 @@ impl GrpcHandle {
         Self { shared }
     }
 
-    /// The bound address. `None` before start. With port `0`, this is the
-    /// real port.
+    /// The bound address. `None` before start, and always `None` with
+    /// `listener = "shared"`. With port `0`, this is the real port.
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.shared.local_addr.get().copied()
@@ -192,19 +228,17 @@ impl GrpcHandle {
     /// 3. Wait for in-flight calls, up to the grace period.
     /// 4. Close the connections that are still open.
     ///
+    /// With `listener = "shared"`, Autumn owns the connections. Steps 2 and
+    /// 4 change: the plugin answers new calls with `UNAVAILABLE`, and it
+    /// ends open calls with `UNAVAILABLE`. The drain also starts by itself
+    /// when Autumn stops its listener.
+    ///
     /// A task does the drain. If you drop this future, the drain continues.
     /// You can call this method more than once, from many tasks. Each call
     /// returns after the server stops.
     pub async fn shutdown(&self) {
         let shared = &self.shared;
-        match shared.lifecycle.apply(LifecycleEvent::ShutdownRequested) {
-            Ok(Lifecycle::Draining) => {
-                tokio::spawn(shared.clone().drain());
-            }
-            // From `Idle`: nothing to drain.
-            Ok(_) => shared.mark_stopped(),
-            Err(_) => {}
-        }
+        shared.request_shutdown();
         let mut stopped = shared.stopped.subscribe();
         let _ = stopped.wait_for(|done| *done).await;
     }
@@ -276,6 +310,7 @@ pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, G
         .grace_ms
         .store(config.shutdown_grace_ms, Ordering::Release);
     let _ = shared.local_addr.set(local_addr);
+    let _ = shared.listener.set(Listener::Dedicated);
 
     let stop = shared.stop.clone();
     let exit = ExitGuard(shared.clone());
@@ -296,6 +331,39 @@ pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, G
         return Err(GrpcError::NotIdle(state));
     }
     Ok(local_addr)
+}
+
+/// Shared mode: no listener. Make the routes available to the gate, then
+/// go to `Serving`.
+pub async fn start_shared(shared: &Arc<Shared>, launch: Launch) -> Result<(), GrpcError> {
+    let Launch {
+        config,
+        routes,
+        health,
+        health_names,
+        ..
+    } = launch;
+    if shared.lifecycle.get() != Lifecycle::Idle {
+        return Err(GrpcError::NotIdle(shared.lifecycle.get()));
+    }
+    if let Some(reporter) = health {
+        let _ = shared.health.set(reporter);
+    }
+    let _ = shared.health_names.set(health_names);
+    shared.set_health(ServingStatus::Serving).await;
+    shared
+        .grace_ms
+        .store(config.shutdown_grace_ms, Ordering::Release);
+    let _ = shared.listener.set(Listener::Shared);
+    let _ = shared.gate.set(crate::gate::Target {
+        router: routes.into_axum_router(),
+        timeout: config.timeout(),
+    });
+    shared
+        .lifecycle
+        .apply(LifecycleEvent::Bound)
+        .map(|_| ())
+        .map_err(GrpcError::NotIdle)
 }
 
 /// Applies `ServerExited` when the server task ends, also on a panic.
@@ -337,6 +405,25 @@ pub fn watch_readiness(shared: &Arc<Shared>, state: AppState) {
                     ServingStatus::Serving
                 };
                 shared.set_health(status).await;
+            }
+        }
+    });
+}
+
+/// Shared mode: start the drain when Autumn stops its listener. Autumn's
+/// HTTP drain waits for gRPC streams too, and its watchdog does not count
+/// them. Without this, an open stream (for example a health `Watch`)
+/// keeps Autumn from reaching the shutdown hooks.
+#[cfg(feature = "multiplex")]
+pub fn drain_on_autumn_shutdown(shared: &Arc<Shared>, state: &AppState) {
+    let shared = shared.clone();
+    let autumn = state.shutdown_token();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = shared.stop.cancelled() => {}
+            () = autumn.cancelled() => {
+                tracing::info!("Autumn is stopping its listener; draining gRPC calls");
+                shared.request_shutdown();
             }
         }
     });

@@ -32,6 +32,16 @@ pub enum GrpcError {
     /// The server is not in `Idle`: a shutdown came before or during start.
     #[error("the gRPC server cannot start in state `{0}`")]
     NotIdle(crate::lifecycle::Lifecycle),
+    /// Another plugin (its config section) uses the shared listener.
+    #[error("only one gRPC plugin can use `listener = \"shared\"`; `[{0}]` uses it already")]
+    SharedListenerTaken(String),
+    /// Autumn's TLS listener does not offer HTTP/2 (ALPN `h2`).
+    #[error(
+        "Autumn TLS (`[server.tls]`) in autumn-web {0} does not offer HTTP/2 (ALPN `h2`), so gRPC \
+         clients cannot connect; autumn-foundation/autumn#2321 fixes this in the next Autumn \
+         release. Use `listener = \"dedicated\"`, or end TLS at a proxy"
+    )]
+    SharedListenerNeedsH2(&'static str),
     /// The startup hook ran twice.
     #[error("the gRPC server is already started")]
     AlreadyStarted,

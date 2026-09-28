@@ -7,7 +7,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use autumn_plugin_grpc::{GrpcConfig, GrpcPlugin, Toggle};
+use autumn_plugin_grpc::{GrpcConfig, GrpcPlugin, Listener, Toggle};
 use autumn_web::config::MockEnv;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -391,4 +391,60 @@ fn profile_aliases_and_names_resolve() {
 
     let debug_off = resolve(env_for(&dir).with("AUTUMN_IS_DEBUG", "0"));
     assert_eq!(debug_off.profile(), "prod");
+}
+
+#[test]
+fn the_listener_defaults_to_dedicated() {
+    assert_eq!(GrpcConfig::default().listener, Listener::Dedicated);
+    let error = GrpcConfig::from_toml_str("[grpc]\nlistener = \"both\"", "grpc").unwrap_err();
+    assert!(error.to_string().contains("both"), "{error}");
+}
+
+#[test]
+fn grpc_tls_is_an_error_in_shared_mode() {
+    let text =
+        "[grpc]\nlistener = \"shared\"\n[grpc.tls]\ncert_path = \"a.pem\"\nkey_path = \"b.pem\"";
+    let error = GrpcConfig::from_toml_str(text, "grpc").unwrap_err();
+    assert!(error.message().contains("server.tls"), "{error}");
+}
+
+#[cfg(feature = "multiplex")]
+#[test]
+fn shared_mode_parses_from_files_and_env() {
+    let config = GrpcConfig::from_toml_str("[grpc]\nlistener = \"shared\"", "grpc").unwrap();
+    assert_eq!(config.listener, Listener::Shared);
+
+    let dir = temp_dir("listener-env");
+    let env = env_for(&dir).with("AUTUMN_GRPC__LISTENER", "shared");
+    let resolved = GrpcConfig::resolve_with_env("grpc", &env).unwrap();
+    assert_eq!(resolved.config().listener, Listener::Shared);
+
+    let env = env_for(&dir).with("AUTUMN_GRPC__LISTENER", "both");
+    let error = GrpcConfig::resolve_with_env("grpc", &env).unwrap_err();
+    assert!(error.message().contains("AUTUMN_GRPC__LISTENER"), "{error}");
+}
+
+#[cfg(not(feature = "multiplex"))]
+#[test]
+fn shared_mode_without_the_multiplex_feature_stops_boot() {
+    let error = GrpcConfig::from_toml_str("[grpc]\nlistener = \"shared\"", "grpc").unwrap_err();
+    assert!(error.message().contains("multiplex"), "{error}");
+
+    let plugin = common::echo_plugin().configure(|c| c.listener = Listener::Shared);
+    let handle = plugin.handle();
+    let outcome = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
+        }))
+    })
+    .join()
+    .unwrap();
+    let message = outcome
+        .err()
+        .and_then(|panic| panic.downcast::<String>().ok())
+        .expect("boot must fail");
+    assert!(message.contains("multiplex"), "{message}");
+    assert_eq!(handle.state(), autumn_plugin_grpc::Lifecycle::Failed);
 }

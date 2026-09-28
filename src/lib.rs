@@ -15,7 +15,8 @@
 //! ```
 //!
 //! The plugin runs a dedicated HTTP/2 listener (default `0.0.0.0:50051`).
-//! It adds:
+//! With the `multiplex` feature and `listener = "shared"`, it uses
+//! Autumn's HTTP port instead. It adds:
 //!
 //! - the standard health service `grpc.health.v1.Health`,
 //! - server reflection (on in `dev`/`test`),
@@ -30,6 +31,7 @@
 
 mod config;
 mod error;
+mod gate;
 mod health;
 mod lifecycle;
 mod metrics;
@@ -38,7 +40,7 @@ mod registry;
 mod server;
 mod tls;
 
-pub use config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved, TlsConfig, Toggle};
+pub use config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved, TlsConfig, Toggle};
 pub use error::GrpcError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 pub use plugin::{GrpcPlugin, PLUGIN_NAME, SUPPORTED_AUTUMN_WEB};

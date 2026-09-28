@@ -15,8 +15,9 @@ use tonic::server::NamedService;
 use tonic::service::Routes;
 use tower::{Layer, Service};
 
-use crate::config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved};
+use crate::config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved};
 use crate::error::GrpcError;
+use crate::gate::{GrpcGate, SharedOwner};
 use crate::health::GrpcHealthIndicator;
 use crate::lifecycle::LifecycleEvent;
 use crate::metrics::MetricsLayer;
@@ -56,7 +57,8 @@ struct Pending {
     descriptors: Vec<&'static [u8]>,
 }
 
-/// Serves tonic services from an Autumn app, on a dedicated HTTP/2 listener.
+/// Serves tonic services from an Autumn app, on a dedicated HTTP/2 listener
+/// or on Autumn's HTTP port (`listener = "shared"`).
 ///
 /// ```rust,ignore
 /// use autumn_plugin_grpc::GrpcPlugin;
@@ -261,7 +263,7 @@ impl GrpcPlugin {
 
     /// The gRPC services as `autumn routes` lists them. The method is
     /// `GRPC` and the path is `/<service>/*`. These routes are on the gRPC
-    /// listener, not on the HTTP port.
+    /// listener, or on the HTTP port in shared mode.
     #[must_use]
     pub fn route_infos(&self) -> Vec<RouteInfo> {
         let Ok(resolved) = self.resolved() else {
@@ -334,6 +336,13 @@ impl GrpcPlugin {
         self.development = Some(development);
         self.reset();
         self
+    }
+
+    /// Choose the listener: [`Listener::Dedicated`] (default) or
+    /// [`Listener::Shared`] (Autumn's HTTP port, feature `multiplex`).
+    #[must_use]
+    pub fn listener(self, listener: Listener) -> Self {
+        self.configure(move |c| c.listener = listener)
     }
 
     /// Set the listen address, `IP:port`.
@@ -542,21 +551,22 @@ impl Plugin for GrpcPlugin {
         let shared = self.shared.clone();
 
         if let Some(error) = problem {
-            // Fail at startup, where Autumn reports hook errors.
-            return app.on_startup(move |_state| {
-                let error = error.clone();
-                let shared = shared.clone();
-                async move {
-                    let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
-                    shared.mark_stopped();
-                    Err(startup_error(&GrpcError::Config(error)))
-                }
-            });
+            return fail_at_startup(app, shared, &GrpcError::Config(error));
         }
         if !config.enabled {
             tracing::info!(section = %self.section, "gRPC server disabled by configuration");
             return app;
         }
+        let app = if config.listener == Listener::Shared {
+            if let Some(owner) = app.extension::<SharedOwner>() {
+                let error = GrpcError::SharedListenerTaken(owner.0.clone());
+                return fail_at_startup(app, shared, &error);
+            }
+            app.with_extension(SharedOwner(self.section.clone()))
+                .static_gate(GrpcGate::new(shared.clone()))
+        } else {
+            app
+        };
 
         let pending = Arc::new(Mutex::new(Some(Pending {
             registrations: std::mem::take(&mut self.registrations),
@@ -596,8 +606,8 @@ impl Plugin for GrpcPlugin {
                     None => Err(GrpcError::AlreadyStarted),
                 };
                 match result {
-                    Ok(addr) => {
-                        tracing::info!(%addr, services = ?user_names, "gRPC server listening");
+                    Ok(listening) => {
+                        tracing::info!(%listening, services = ?user_names, "gRPC server listening");
                         state.insert_extension(servers);
                         if is_default {
                             state.insert_extension(GrpcHandle::new(shared));
@@ -628,6 +638,21 @@ impl Plugin for GrpcPlugin {
                 async move { handle.shutdown().await }
             })
     }
+}
+
+/// Fail at startup, where Autumn reports hook errors.
+fn fail_at_startup(app: AppBuilder, shared: Arc<Shared>, error: &GrpcError) -> AppBuilder {
+    // `GrpcError` is not `Clone`; the hook can run more than once.
+    let message = error.to_string();
+    app.on_startup(move |_state| {
+        let shared = shared.clone();
+        let message = message.clone();
+        async move {
+            let _ = shared.lifecycle.apply(LifecycleEvent::StartFailed);
+            shared.mark_stopped();
+            Err(startup_message(&message))
+        }
+    })
 }
 
 /// Autumn runs plugin shutdown hooks after the HTTP drain, inside
@@ -666,7 +691,106 @@ fn warn_on_open_reflection(config: &GrpcConfig, development: bool) {
     }
 }
 
+/// Where the server listens, for the startup log.
+enum Listening {
+    Dedicated(std::net::SocketAddr),
+    Shared,
+}
+
+impl std::fmt::Display for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dedicated(addr) => write!(f, "{addr}"),
+            Self::Shared => f.write_str("Autumn's HTTP port (shared)"),
+        }
+    }
+}
+
 async fn launch(
+    state: &AppState,
+    pending: Pending,
+    config: GrpcConfig,
+    development: bool,
+    shared: &Arc<Shared>,
+    user_names: &[&'static str],
+) -> Result<Listening, GrpcError> {
+    if config.listener == Listener::Shared {
+        launch_shared(state, pending, config, development, shared, user_names).await?;
+        return Ok(Listening::Shared);
+    }
+    launch_dedicated(state, pending, config, development, shared, user_names)
+        .await
+        .map(Listening::Dedicated)
+}
+
+/// Shared mode checks that need `AppState`. Logs the warnings.
+fn check_shared(state: &AppState, config: &GrpcConfig, development: bool) -> Result<(), GrpcError> {
+    let autumn = state.config_arc();
+    if autumn.server.tls.is_some() {
+        return Err(GrpcError::SharedListenerNeedsH2(SUPPORTED_AUTUMN_WEB));
+    }
+    for warning in shared_warnings(config, &autumn.server.host, development) {
+        tracing::warn!("{warning}");
+    }
+    Ok(())
+}
+
+/// Warnings for shared mode. There is at most one for the ignored
+/// settings.
+fn shared_warnings(config: &GrpcConfig, autumn_host: &str, development: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let ignored = config.dedicated_only_settings();
+    if !ignored.is_empty() {
+        warnings.push(format!(
+            "these gRPC settings have no effect with `listener = \"shared\"`, because Autumn's server owns the port: {}",
+            ignored.join(", ")
+        ));
+    }
+    let host = autumn_host.trim();
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback && config.reflection.resolve(development) {
+        warnings.push(format!(
+            "gRPC reflection is on and Autumn's port is not on loopback (host `{host}`); set `reflection = false` to hide the API"
+        ));
+    }
+    warnings
+}
+
+async fn launch_shared(
+    state: &AppState,
+    pending: Pending,
+    mut config: GrpcConfig,
+    development: bool,
+    shared: &Arc<Shared>,
+    user_names: &[&'static str],
+) -> Result<(), GrpcError> {
+    check_shared(state, &config, development)?;
+    fit_grace_to_autumn(&mut config, state);
+    let (routes, health) = build_routes(state, pending, &config, development, shared, user_names)?;
+    let health_names = user_names.iter().map(|n| (*n).to_owned()).collect();
+    crate::server::start_shared(
+        shared,
+        Launch {
+            config,
+            development,
+            routes,
+            health,
+            health_names,
+            #[cfg(feature = "tls")]
+            tls: None,
+        },
+    )
+    .await?;
+    crate::server::watch_readiness(shared, state.clone());
+    #[cfg(feature = "multiplex")]
+    crate::server::drain_on_autumn_shutdown(shared, state);
+    Ok(())
+}
+
+async fn launch_dedicated(
     state: &AppState,
     pending: Pending,
     mut config: GrpcConfig,
@@ -702,5 +826,52 @@ async fn launch(
 }
 
 fn startup_error(error: &GrpcError) -> autumn_web::AutumnError {
-    autumn_web::AutumnError::internal_server_error_msg(format!("{PLUGIN_NAME}: {error}"))
+    startup_message(&error.to_string())
+}
+
+fn startup_message(message: &str) -> autumn_web::AutumnError {
+    autumn_web::AutumnError::internal_server_error_msg(format!("{PLUGIN_NAME}: {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Toggle;
+
+    #[test]
+    fn shared_mode_warns_once_for_ignored_settings() {
+        let mut config = GrpcConfig {
+            reflection: Toggle::Off,
+            ..GrpcConfig::default()
+        };
+        assert!(shared_warnings(&config, "0.0.0.0", false).is_empty());
+
+        config.bind = "127.0.0.1:0".to_owned();
+        config.max_connection_age_ms = 5;
+        let warnings = shared_warnings(&config, "0.0.0.0", false);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("bind, max_connection_age_ms"));
+    }
+
+    #[test]
+    fn shared_mode_warns_for_reflection_off_loopback() {
+        let mut config = GrpcConfig {
+            reflection: Toggle::On,
+            ..GrpcConfig::default()
+        };
+        for host in ["127.0.0.1", "::1", "localhost", " LocalHost "] {
+            assert!(shared_warnings(&config, host, false).is_empty(), "{host}");
+        }
+        for host in ["0.0.0.0", "10.0.0.5", "example.com"] {
+            let warnings = shared_warnings(&config, host, false);
+            assert_eq!(warnings.len(), 1, "{host}");
+            assert!(warnings[0].contains("reflection"));
+        }
+        config.reflection = Toggle::Auto;
+        assert_eq!(shared_warnings(&config, "0.0.0.0", true).len(), 1, "dev");
+        assert!(
+            shared_warnings(&config, "0.0.0.0", false).is_empty(),
+            "prod"
+        );
+    }
 }
