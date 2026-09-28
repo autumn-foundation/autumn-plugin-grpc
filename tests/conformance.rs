@@ -7,15 +7,66 @@ mod common;
 use autumn_plugin_grpc::{GrpcPlugin, PLUGIN_NAME};
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
+use autumn_web::route_listing::{RouteClassification, RouteInfo, RouteSource};
+
+/// The routes as `declare_plugin_routes` attributes them.
+fn manifest(plugin: &GrpcPlugin) -> Vec<RouteInfo> {
+    let name = plugin.name().into_owned();
+    plugin
+        .route_infos()
+        .into_iter()
+        .map(|mut route| {
+            route.source = RouteSource::Plugin(name.clone());
+            route
+        })
+        .collect()
+}
+
+fn listed(routes: &[RouteInfo]) -> Vec<String> {
+    let mut listed: Vec<String> = routes
+        .iter()
+        .map(|r| format!("{} {} {}", r.method, r.path, r.classification.as_str()))
+        .collect();
+    listed.sort();
+    listed
+}
 
 #[test]
 fn passes_the_framework_conformance_harness() {
     let plugin = common::echo_plugin();
     let name = plugin.name().into_owned();
     assert_eq!(name, format!("{PLUGIN_NAME}@grpc"));
-    // gRPC uses its own listener, so the plugin mounts no HTTP routes.
-    let report = run_conformance(&ConformanceConfig::new(&name), &[]);
+    let routes = manifest(&plugin);
+    let report = run_conformance(&ConformanceConfig::new(&name), &routes);
     assert!(report.passed(), "{}", report.to_text_report());
+    assert_eq!(
+        listed(&routes),
+        [
+            "GRPC /autumn.echo.v1.Echo/* public",
+            "GRPC /grpc.health.v1.Health/* public",
+            "GRPC /grpc.reflection.v1.ServerReflection/* public",
+            "GRPC /grpc.reflection.v1alpha.ServerReflection/* public",
+        ]
+    );
+}
+
+#[test]
+fn declarations_follow_the_configuration() {
+    let plugin = common::echo_plugin()
+        .development(false)
+        .gated("bearer token")
+        .configure(|c| c.health = false);
+    let routes = manifest(&plugin);
+    assert_eq!(listed(&routes), ["GRPC /autumn.echo.v1.Echo/* gated"]);
+    assert_eq!(routes[0].classification, RouteClassification::Gated);
+    assert_eq!(routes[0].middleware, ["bearer token"]);
+    let report = run_conformance(&ConformanceConfig::new(plugin.name()), &routes);
+    assert!(report.passed(), "{}", report.to_text_report());
+
+    let disabled = common::echo_plugin().configure(|c| c.enabled = false);
+    assert!(disabled.route_infos().is_empty());
+    let invalid = common::echo_plugin().configure(|c| c.shutdown_grace_ms = 0);
+    assert!(invalid.route_infos().is_empty());
 }
 
 #[test]

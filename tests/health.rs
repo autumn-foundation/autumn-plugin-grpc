@@ -5,6 +5,7 @@
 mod common;
 
 use common::{boot, channel};
+
 use tonic::Code;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -83,7 +84,7 @@ async fn the_reporter_lets_the_app_mark_a_service_down() {
     let (_http, handle) = boot(common::echo_plugin());
     let reporter = handle.health_reporter().expect("health on by default");
     reporter
-        .set_service_status("autumn.echo.v1.Echo", ServingStatus::NotServing)
+        .set_service_status("autumn.echo.v1.Echo", tonic_health::ServingStatus::NotServing)
         .await;
     let mut health = HealthClient::new(channel(&handle).await);
     assert_eq!(
@@ -95,7 +96,10 @@ async fn the_reporter_lets_the_app_mark_a_service_down() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn autumn_actuator_health_includes_the_grpc_indicator() {
-    let (http, handle) = boot(common::echo_plugin());
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.health.detailed = true;
+    let app = autumn_web::test::TestApp::new().config(config);
+    let (http, handle) = common::boot_with(app, common::echo_plugin());
     let response = http.get("/actuator/health").send().await;
     let body: serde_json::Value = response.json();
     let grpc = find_component(&body, "grpc").unwrap_or_else(|| panic!("no grpc component: {body}"));

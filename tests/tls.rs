@@ -136,7 +136,7 @@ fn a_missing_certificate_file_aborts_boot() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let _guard = runtime.enter();
-            autumn_web::test::TestApp::new().plugin(plugin).build();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
         }))
     })
     .join()

@@ -215,7 +215,7 @@ fn an_invalid_override_is_reported_and_aborts_boot() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let _guard = runtime.enter();
-            autumn_web::test::TestApp::new().plugin(plugin).build();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
         }))
     })
     .join()
@@ -235,7 +235,7 @@ fn tls_paths_without_the_feature_abort_boot() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let _guard = runtime.enter();
-            autumn_web::test::TestApp::new().plugin(plugin).build();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
         }))
     })
     .join()

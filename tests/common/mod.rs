@@ -1,6 +1,6 @@
 //! Shared test fixtures: the generated `Echo` service and helpers.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use std::net::SocketAddr;
 use std::pin::Pin;

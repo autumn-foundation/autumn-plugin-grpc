@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "axum",
+ "bytes",
  "futures-util",
  "http",
  "http-body",
@@ -193,6 +194,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tonic-health",

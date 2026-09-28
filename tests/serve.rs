@@ -133,7 +133,7 @@ async fn a_bind_failure_aborts_boot() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let _guard = runtime.enter();
-            TestApp::new().plugin(plugin).build();
+            let _ = TestApp::new().plugin(plugin).build();
         }))
     })
     .join()
