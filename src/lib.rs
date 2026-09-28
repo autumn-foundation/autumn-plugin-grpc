@@ -37,7 +37,9 @@ mod plugin;
 mod server;
 mod tls;
 
-pub use config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved, TlsConfig, Toggle, env_prefix};
+pub use config::{
+    ConfigError, DEFAULT_SECTION, GrpcConfig, Resolved, TlsConfig, Toggle, env_prefix,
+};
 pub use error::GrpcError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 pub use plugin::{GrpcPlugin, PLUGIN_NAME, SUPPORTED_AUTUMN_WEB};

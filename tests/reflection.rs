@@ -1,19 +1,17 @@
 //! Reflection: AC5.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
 use common::{boot, channel};
 use tonic::Code;
+use tonic_reflection::pb::v1::ServerReflectionRequest;
 use tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient;
 use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
 use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
-use tonic_reflection::pb::v1::ServerReflectionRequest;
 
-async fn list_services(
-    channel: tonic::transport::Channel,
-) -> Result<Vec<String>, tonic::Status> {
+async fn list_services(channel: tonic::transport::Channel) -> Result<Vec<String>, tonic::Status> {
     let mut client = ServerReflectionClient::new(channel);
     let request = ServerReflectionRequest {
         host: String::new(),
@@ -38,8 +36,14 @@ async fn list_services(
 async fn development_lists_user_health_and_reflection_services() {
     let (_http, handle) = boot(common::echo_plugin());
     let names = list_services(channel(&handle).await).await.unwrap();
-    assert!(names.contains(&"autumn.echo.v1.Echo".to_owned()), "{names:?}");
-    assert!(names.contains(&"grpc.health.v1.Health".to_owned()), "{names:?}");
+    assert!(
+        names.contains(&"autumn.echo.v1.Echo".to_owned()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"grpc.health.v1.Health".to_owned()),
+        "{names:?}"
+    );
     assert!(
         names.contains(&"grpc.reflection.v1.ServerReflection".to_owned()),
         "{names:?}"

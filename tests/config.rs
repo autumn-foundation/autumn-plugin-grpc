@@ -1,6 +1,6 @@
 //! Configuration: AC2, AC9 and AC10 (TLS without the feature).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
@@ -11,10 +11,8 @@ use autumn_plugin_grpc::{GrpcConfig, GrpcPlugin, Toggle};
 use autumn_web::config::MockEnv;
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "autumn-grpc-config-{name}-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("autumn-grpc-config-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -61,8 +59,14 @@ fn reads_the_section_from_toml() {
     assert_eq!(config.max_concurrent_streams, 64);
     assert!(!config.tcp_nodelay);
     assert_eq!(config.tcp_keepalive(), Some(Duration::from_secs(30)));
-    assert_eq!(config.http2_keepalive_interval(), Some(Duration::from_secs(10)));
-    assert_eq!(config.http2_keepalive_timeout(), Some(Duration::from_secs(5)));
+    assert_eq!(
+        config.http2_keepalive_interval(),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        config.http2_keepalive_timeout(),
+        Some(Duration::from_secs(5))
+    );
     assert_eq!(config.max_connection_age(), Some(Duration::from_secs(600)));
 }
 
@@ -144,7 +148,10 @@ fn resolves_profiles_files_and_environment_in_order() {
     assert!(!resolved.is_development());
     assert_eq!(resolved.config.bind, "127.0.0.1:2000", "env wins");
     assert_eq!(resolved.config.timeout_ms, 200, "inline profile applies");
-    assert_eq!(resolved.config.shutdown_grace_ms, 333, "profile file applies");
+    assert_eq!(
+        resolved.config.shutdown_grace_ms, 333,
+        "profile file applies"
+    );
 
     let dev = GrpcConfig::resolve_with_env("grpc", &env_for(&dir)).unwrap();
     assert!(dev.is_development());
@@ -170,7 +177,11 @@ fn nested_env_overrides_apply_and_bad_ones_are_ignored() {
 #[test]
 fn a_custom_section_uses_its_own_env_prefix() {
     let dir = temp_dir("section");
-    std::fs::write(dir.join("autumn.toml"), "[grpc_admin]\nbind = \"127.0.0.1:7000\"\n").unwrap();
+    std::fs::write(
+        dir.join("autumn.toml"),
+        "[grpc_admin]\nbind = \"127.0.0.1:7000\"\n",
+    )
+    .unwrap();
     let env = env_for(&dir).with("AUTUMN_GRPC_ADMIN__TIMEOUT_MS", "9");
     let resolved = GrpcConfig::resolve_with_env("grpc_admin", &env).unwrap();
     assert_eq!(resolved.config.bind, "127.0.0.1:7000");
@@ -273,7 +284,10 @@ async fn transport_settings_apply_to_the_server() {
         .await
         .unwrap_err();
     assert!(
-        matches!(status.code(), tonic::Code::Cancelled | tonic::Code::DeadlineExceeded),
+        matches!(
+            status.code(),
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+        ),
         "{status:?}"
     );
     handle.shutdown().await;

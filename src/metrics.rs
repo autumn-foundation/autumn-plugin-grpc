@@ -30,7 +30,7 @@ const UNKNOWN: &str = "unknown";
 const OTHER: &str = "other";
 
 /// Metric families this module emits.
-pub(crate) mod names {
+pub mod names {
     pub const HANDLED: &str = "grpc_server_handled_total";
     pub const SECONDS_SUM: &str = "grpc_server_handling_seconds_sum";
     pub const SECONDS_COUNT: &str = "grpc_server_handling_seconds_count";
@@ -39,7 +39,7 @@ pub(crate) mod names {
 }
 
 /// The canonical name of a gRPC status code.
-fn code_name(code: i32) -> &'static str {
+const fn code_name(code: i32) -> &'static str {
     match code {
         0 => "OK",
         1 => "CANCELLED",
@@ -83,7 +83,7 @@ struct Settings {
 }
 
 /// Shared metric state for one server.
-pub(crate) struct Metrics {
+pub struct Metrics {
     settings: RwLock<Settings>,
     series: Mutex<Series>,
     in_flight: AtomicI64,
@@ -91,7 +91,7 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             settings: RwLock::new(Settings {
                 max_series: 1000,
@@ -104,14 +104,24 @@ impl Metrics {
     }
 
     /// Set the options that the startup hook knows.
-    pub(crate) fn configure(&self, max_series: usize, services: HashSet<String>) {
-        let mut settings = self.settings.write().unwrap_or_else(PoisonError::into_inner);
+    pub fn configure(&self, max_series: usize, services: HashSet<String>) {
+        let mut settings = self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         settings.max_series = max_series.max(1);
         settings.services = services;
     }
 
-    pub(crate) fn set_up(&self, up: bool) {
+    pub fn set_up(&self, up: bool) {
         self.up.store(up, Ordering::Release);
+    }
+
+    fn max_series(&self) -> usize {
+        self.settings
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .max_series
     }
 
     /// Bounded labels for a request path.
@@ -127,6 +137,8 @@ impl Metrics {
         }
     }
 
+    // False positive: `timed` borrows the guard until the last line.
+    #[allow(clippy::significant_drop_tightening)]
     fn record(&self, service: String, method: String, code: i32, seconds: f64) {
         let code = code_name(code);
         let method = if code == "UNIMPLEMENTED" {
@@ -134,11 +146,7 @@ impl Metrics {
         } else {
             method
         };
-        let max_series = self
-            .settings
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .max_series;
+        let max_series = self.max_series();
         let mut series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         let mut key = (service, method, code);
         if !series.handled.contains_key(&key) && series.handled.len() >= max_series {
@@ -152,7 +160,7 @@ impl Metrics {
     }
 
     /// A snapshot as Autumn metric families.
-    pub(crate) fn families(&self) -> Vec<MetricFamily> {
+    pub fn families(&self) -> Vec<MetricFamily> {
         let series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         let mut handled: Vec<MetricSample> = series
             .handled
@@ -190,13 +198,42 @@ impl Metrics {
         drop(series);
         #[allow(clippy::cast_precision_loss)]
         let in_flight = self.in_flight.load(Ordering::Acquire) as f64;
-        let up = if self.up.load(Ordering::Acquire) { 1.0 } else { 0.0 };
+        let up = if self.up.load(Ordering::Acquire) {
+            1.0
+        } else {
+            0.0
+        };
         vec![
-            family(names::HANDLED, "gRPC calls completed, by service, method and status code.", MetricKind::Counter, handled),
-            family(names::SECONDS_SUM, "Total gRPC call time in seconds.", MetricKind::Counter, sums),
-            family(names::SECONDS_COUNT, "gRPC calls timed.", MetricKind::Counter, counts),
-            family(names::IN_FLIGHT, "gRPC calls in progress.", MetricKind::Gauge, vec![unlabelled(in_flight)]),
-            family(names::UP, "1 when the gRPC server is serving, else 0.", MetricKind::Gauge, vec![unlabelled(up)]),
+            family(
+                names::HANDLED,
+                "gRPC calls completed, by service, method and status code.",
+                MetricKind::Counter,
+                handled,
+            ),
+            family(
+                names::SECONDS_SUM,
+                "Total gRPC call time in seconds.",
+                MetricKind::Counter,
+                sums,
+            ),
+            family(
+                names::SECONDS_COUNT,
+                "gRPC calls timed.",
+                MetricKind::Counter,
+                counts,
+            ),
+            family(
+                names::IN_FLIGHT,
+                "gRPC calls in progress.",
+                MetricKind::Gauge,
+                vec![unlabelled(in_flight)],
+            ),
+            family(
+                names::UP,
+                "1 when the gRPC server is serving, else 0.",
+                MetricKind::Gauge,
+                vec![unlabelled(up)],
+            ),
         ]
     }
 }
@@ -304,12 +341,12 @@ impl http_body::Body for TrackedBody {
 
 /// Tower layer that feeds [`Metrics`].
 #[derive(Clone)]
-pub(crate) struct MetricsLayer {
+pub struct MetricsLayer {
     metrics: Arc<Metrics>,
 }
 
 impl MetricsLayer {
-    pub(crate) const fn new(metrics: Arc<Metrics>) -> Self {
+    pub const fn new(metrics: Arc<Metrics>) -> Self {
         Self { metrics }
     }
 }
@@ -327,7 +364,7 @@ impl<S> tower::Layer<S> for MetricsLayer {
 
 /// The service of [`MetricsLayer`].
 #[derive(Clone)]
-pub(crate) struct MetricsService<S> {
+pub struct MetricsService<S> {
     inner: S,
     metrics: Arc<Metrics>,
 }
@@ -378,7 +415,10 @@ mod tests {
         let metrics = Metrics::new();
         metrics.configure(10, HashSet::from(["a.B".to_owned()]));
         assert_eq!(metrics.labels("/a.B/Call"), ("a.B".into(), "Call".into()));
-        assert_eq!(metrics.labels("/x.Y/Call"), (UNKNOWN.into(), UNKNOWN.into()));
+        assert_eq!(
+            metrics.labels("/x.Y/Call"),
+            (UNKNOWN.into(), UNKNOWN.into())
+        );
         assert_eq!(metrics.labels("/a.B/"), (UNKNOWN.into(), UNKNOWN.into()));
         assert_eq!(metrics.labels("/a.B/C/D"), (UNKNOWN.into(), UNKNOWN.into()));
         assert_eq!(metrics.labels(""), (UNKNOWN.into(), UNKNOWN.into()));

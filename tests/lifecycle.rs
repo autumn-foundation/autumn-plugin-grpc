@@ -4,7 +4,12 @@
 //! pair, so it is a complete model check. The property tests check the
 //! invariants over random event sequences.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+#![allow(
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::single_match_else
+)] // one spec row per transition
 
 use autumn_plugin_grpc::{Lifecycle, LifecycleEvent};
 use proptest::prelude::*;

@@ -1,6 +1,6 @@
 //! Health: AC4 (gRPC health service) and AC6 (Autumn health indicator).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
@@ -11,7 +11,10 @@ use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
 
-async fn check(client: &mut HealthClient<tonic::transport::Channel>, service: &str) -> ServingStatus {
+async fn check(
+    client: &mut HealthClient<tonic::transport::Channel>,
+    service: &str,
+) -> ServingStatus {
     client
         .check(HealthCheckRequest {
             service: service.to_owned(),
@@ -84,7 +87,10 @@ async fn the_reporter_lets_the_app_mark_a_service_down() {
     let (_http, handle) = boot(common::echo_plugin());
     let reporter = handle.health_reporter().expect("health on by default");
     reporter
-        .set_service_status("autumn.echo.v1.Echo", tonic_health::ServingStatus::NotServing)
+        .set_service_status(
+            "autumn.echo.v1.Echo",
+            tonic_health::ServingStatus::NotServing,
+        )
         .await;
     let mut health = HealthClient::new(channel(&handle).await);
     assert_eq!(

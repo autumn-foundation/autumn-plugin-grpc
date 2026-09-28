@@ -1,6 +1,6 @@
 //! Metrics: AC6.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
@@ -53,14 +53,23 @@ async fn counts_calls_by_service_method_and_code() {
         ("grpc_method", "Say"),
         ("grpc_code", "OK"),
     ];
-    assert_eq!(sample(&families, "grpc_server_handled_total", &ok), Some(2.0));
+    assert_eq!(
+        sample(&families, "grpc_server_handled_total", &ok),
+        Some(2.0)
+    );
     let bad = [
         ("grpc_service", "autumn.echo.v1.Echo"),
         ("grpc_method", "Say"),
         ("grpc_code", "INVALID_ARGUMENT"),
     ];
-    assert_eq!(sample(&families, "grpc_server_handled_total", &bad), Some(1.0));
-    let say = [("grpc_service", "autumn.echo.v1.Echo"), ("grpc_method", "Say")];
+    assert_eq!(
+        sample(&families, "grpc_server_handled_total", &bad),
+        Some(1.0)
+    );
+    let say = [
+        ("grpc_service", "autumn.echo.v1.Echo"),
+        ("grpc_method", "Say"),
+    ];
     assert_eq!(
         sample(&families, "grpc_server_handling_seconds_count", &say),
         Some(3.0)
@@ -69,7 +78,10 @@ async fn counts_calls_by_service_method_and_code() {
     assert_eq!(sample(&families, "grpc_server_in_flight", &[]), Some(0.0));
     assert_eq!(sample(&families, "grpc_server_up", &[]), Some(1.0));
     handle.shutdown().await;
-    assert_eq!(sample(&handle.metric_families(), "grpc_server_up", &[]), Some(0.0));
+    assert_eq!(
+        sample(&handle.metric_families(), "grpc_server_up", &[]),
+        Some(0.0)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -103,7 +115,10 @@ async fn unknown_paths_collapse_into_one_series() {
         ("grpc_method", "unknown"),
         ("grpc_code", "UNIMPLEMENTED"),
     ];
-    assert_eq!(sample(&families, "grpc_server_handled_total", &unknown), Some(20.0));
+    assert_eq!(
+        sample(&families, "grpc_server_handled_total", &unknown),
+        Some(20.0)
+    );
     let echo_unknown = [
         ("grpc_service", "autumn.echo.v1.Echo"),
         ("grpc_method", "unknown"),
@@ -140,7 +155,10 @@ async fn series_are_capped() {
         ("grpc_method", "other"),
         ("grpc_code", "other"),
     ];
-    assert_eq!(sample(&families, "grpc_server_handled_total", &overflow), Some(1.0));
+    assert_eq!(
+        sample(&families, "grpc_server_handled_total", &overflow),
+        Some(1.0)
+    );
     handle.shutdown().await;
 }
 

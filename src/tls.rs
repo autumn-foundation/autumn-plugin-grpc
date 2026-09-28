@@ -10,7 +10,7 @@ use crate::error::GrpcError;
 /// [`GrpcError::Tls`] when a file cannot be read, or when TLS is set but
 /// the crate has no `tls` feature.
 #[cfg(feature = "tls")]
-pub(crate) fn server_config(
+pub fn server_config(
     config: &TlsConfig,
 ) -> Result<Option<tonic::transport::ServerTlsConfig>, GrpcError> {
     use tonic::transport::{Certificate, Identity, ServerTlsConfig};
@@ -34,7 +34,7 @@ pub(crate) fn server_config(
 /// Without the `tls` feature, TLS settings are an error: plain text must
 /// not replace TLS silently.
 #[cfg(not(feature = "tls"))]
-pub(crate) fn server_config(config: &TlsConfig) -> Result<(), GrpcError> {
+pub fn server_config(config: &TlsConfig) -> Result<(), GrpcError> {
     if config.is_enabled() {
         return Err(GrpcError::Tls(
             "`tls.cert_path` is set, but autumn-plugin-grpc is built without the `tls` \

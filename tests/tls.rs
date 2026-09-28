@@ -1,7 +1,7 @@
 //! TLS and mTLS: AC10 (feature `tls`).
 
 #![cfg(feature = "tls")]
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
@@ -55,7 +55,10 @@ fn path(dir: &Path, file: &str) -> String {
     dir.join(file).to_string_lossy().into_owned()
 }
 
-async fn tls_channel(addr: std::net::SocketAddr, tls: ClientTlsConfig) -> Result<Channel, tonic::transport::Error> {
+async fn tls_channel(
+    addr: std::net::SocketAddr,
+    tls: ClientTlsConfig,
+) -> Result<Channel, tonic::transport::Error> {
     Channel::from_shared(format!("https://localhost:{}", addr.port()))
         .unwrap()
         .tls_config(tls)

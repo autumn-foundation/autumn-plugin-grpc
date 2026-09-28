@@ -1,7 +1,7 @@
 //! End-to-end serving: AC1 (serve), AC3 (`AppState`), AC8 (bind failure)
 //! and AC11 (user layers).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 

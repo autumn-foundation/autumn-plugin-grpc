@@ -160,8 +160,9 @@ impl GrpcPlugin {
         S::Future: Send + 'static,
     {
         self.service_names.push(S::NAME);
-        self.registrations
-            .push(Box::new(move |state, routes| routes.add_service(build(state))));
+        self.registrations.push(Box::new(move |state, routes| {
+            routes.add_service(build(state))
+        }));
         self
     }
 
@@ -188,7 +189,8 @@ impl GrpcPlugin {
         <L::Service as Service<axum::extract::Request>>::Error: Into<Infallible> + 'static,
         <L::Service as Service<axum::extract::Request>>::Future: Send + 'static,
     {
-        self.layers.push(Box::new(move |router| router.layer(layer)));
+        self.layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
@@ -299,9 +301,7 @@ impl GrpcPlugin {
     /// A handle to this plugin's server. It is valid before and after boot.
     #[must_use]
     pub fn handle(&self) -> GrpcHandle {
-        GrpcHandle {
-            shared: self.shared.clone(),
-        }
+        GrpcHandle::new(self.shared.clone())
     }
 
     /// Names of the services added with `add_service*`.
@@ -348,8 +348,49 @@ fn grpc_route(service: &str, gated: Option<&str>) -> RouteInfo {
     }
 }
 
-/// Assemble the routes. User layers wrap only user services: axum applies
-/// a layer to the routes that exist when `layer` is called.
+/// User services, wrapped by the user layers. axum applies a layer only to
+/// the routes that exist when `layer` is called, so services added later
+/// (health, reflection) are not wrapped.
+fn user_routes(
+    state: &AppState,
+    registrations: Vec<Registration>,
+    layers: Vec<RouterLayer>,
+) -> Routes {
+    let registered = registrations
+        .into_iter()
+        .fold(Routes::default(), |routes, register| {
+            register(state, routes)
+        });
+    let layered = layers
+        .into_iter()
+        .fold(registered.into_axum_router(), |router, apply| apply(router));
+    Routes::from(layered)
+}
+
+/// Add reflection v1 and v1alpha over the user and health descriptor sets.
+fn add_reflection(
+    routes: Routes,
+    descriptors: &[&'static [u8]],
+    health: bool,
+) -> Result<Routes, GrpcError> {
+    let configure = || {
+        let mut builder = tonic_reflection::server::Builder::configure();
+        if health {
+            builder =
+                builder.register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET);
+        }
+        descriptors.iter().fold(builder, |builder, set| {
+            builder.register_encoded_file_descriptor_set(set)
+        })
+    };
+    let invalid = |e: tonic_reflection::server::Error| GrpcError::Reflection(e.to_string());
+    let v1 = configure().build_v1().map_err(invalid)?;
+    let v1alpha = configure().build_v1alpha().map_err(invalid)?;
+    Ok(routes.add_service(v1).add_service(v1alpha))
+}
+
+/// Assemble all routes: user services, then health and reflection, then
+/// the `AppState` and metrics layers around everything.
 fn build_routes(
     state: &AppState,
     pending: Pending,
@@ -363,58 +404,31 @@ fn build_routes(
         layers,
         descriptors,
     } = pending;
-    let mut routes = Routes::default();
-    for register in registrations {
-        routes = register(state, routes);
-    }
-    let mut router = routes.into_axum_router();
-    for apply in layers {
-        router = apply(router);
-    }
-    let mut routes = Routes::from(router);
+    let mut routes = user_routes(state, registrations, layers);
     let mut known: HashSet<String> = user_names.iter().map(|n| (*n).to_owned()).collect();
 
-    let mut reporter = None;
-    if config.health {
-        let (health_reporter, health_service) = tonic_health::server::health_reporter();
-        routes = routes.add_service(health_service);
+    let reporter = config.health.then(|| {
+        let (reporter, service) = tonic_health::server::health_reporter();
+        routes = std::mem::take(&mut routes).add_service(service);
         known.insert(HEALTH_SERVICE.to_owned());
-        reporter = Some(health_reporter);
-    }
+        reporter
+    });
     if config.reflection.resolve(development) {
-        let builder = || {
-            let mut builder = tonic_reflection::server::Builder::configure();
-            if config.health {
-                builder =
-                    builder.register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET);
-            }
-            for set in &descriptors {
-                builder = builder.register_encoded_file_descriptor_set(set);
-            }
-            builder
-        };
-        let v1 = builder()
-            .build_v1()
-            .map_err(|e| GrpcError::Reflection(e.to_string()))?;
-        let v1alpha = builder()
-            .build_v1alpha()
-            .map_err(|e| GrpcError::Reflection(e.to_string()))?;
-        routes = routes.add_service(v1).add_service(v1alpha);
+        routes = add_reflection(routes, &descriptors, config.health)?;
         known.insert(REFLECTION_V1.to_owned());
         known.insert(REFLECTION_V1ALPHA.to_owned());
     }
 
-    // These wrap every service, the plugin's too.
-    let mut router = routes
+    shared.metrics.configure(config.max_metric_series, known);
+    let with_state = routes
         .into_axum_router()
         .layer(axum::Extension(state.clone()));
-    shared
-        .metrics
-        .configure(config.max_metric_series, known);
-    if config.metrics {
-        router = router.layer(MetricsLayer::new(shared.metrics.clone()));
-    }
-    Ok((Routes::from(router), reporter))
+    let observed = if config.metrics {
+        with_state.layer(MetricsLayer::new(shared.metrics.clone()))
+    } else {
+        with_state
+    };
+    Ok((Routes::from(observed), reporter))
 }
 
 impl Plugin for GrpcPlugin {
@@ -427,11 +441,7 @@ impl Plugin for GrpcPlugin {
     fn build(mut self, app: AppBuilder) -> AppBuilder {
         let app = app.config_section(self.section.clone());
         let (config, development, problem) = match self.resolved() {
-            Ok(resolved) => (
-                resolved.config.clone(),
-                resolved.is_development(),
-                None,
-            ),
+            Ok(resolved) => (resolved.config.clone(), resolved.is_development(), None),
             Err(error) => (GrpcConfig::default(), false, Some(error.clone())),
         };
         let shared = self.shared.clone();
@@ -480,7 +490,7 @@ impl Plugin for GrpcPlugin {
                 match result {
                     Ok(addr) => {
                         tracing::info!(%addr, services = ?user_names, "gRPC server listening");
-                        state.insert_extension(GrpcHandle { shared });
+                        state.insert_extension(GrpcHandle::new(shared));
                         Ok(())
                     }
                     Err(error) => {
@@ -494,28 +504,45 @@ impl Plugin for GrpcPlugin {
         let stop_shared = shared.clone();
         app.declare_plugin_routes(declared)
             .health_indicator(
-            section.clone(),
-            Arc::new(GrpcHealthIndicator {
-                shared: shared.clone(),
-            }),
-        )
-        .metrics_source(
-            format!("{PLUGIN_NAME}@{section}"),
-            Arc::new(GrpcMetricsSource { shared }),
-        )
-        .on_shutdown(move || {
-            let handle = GrpcHandle {
-                shared: stop_shared.clone(),
-            };
-            async move { handle.shutdown().await }
-        })
+                section.clone(),
+                Arc::new(GrpcHealthIndicator {
+                    shared: shared.clone(),
+                }),
+            )
+            .metrics_source(
+                format!("{PLUGIN_NAME}@{section}"),
+                Arc::new(GrpcMetricsSource { shared }),
+            )
+            .on_shutdown(move || {
+                let handle = GrpcHandle::new(stop_shared.clone());
+                async move { handle.shutdown().await }
+            })
+    }
+}
+
+/// Autumn runs plugin shutdown hooks after the HTTP drain, inside
+/// `server.shutdown_timeout_secs`. A longer gRPC grace would be cut off, so
+/// cap it.
+fn fit_grace_to_autumn(config: &mut GrpcConfig, state: &AppState) {
+    let budget_ms = state
+        .config_arc()
+        .server
+        .shutdown_timeout_secs
+        .saturating_mul(1000);
+    if budget_ms > 0 && config.shutdown_grace_ms > budget_ms {
+        tracing::warn!(
+            shutdown_grace_ms = config.shutdown_grace_ms,
+            budget_ms,
+            "gRPC shutdown_grace_ms is longer than server.shutdown_timeout_secs; using the shorter value"
+        );
+        config.shutdown_grace_ms = budget_ms;
     }
 }
 
 async fn launch(
     state: &AppState,
     pending: Pending,
-    config: GrpcConfig,
+    mut config: GrpcConfig,
     development: bool,
     shared: &Arc<Shared>,
     user_names: &[&'static str],
@@ -526,6 +553,7 @@ async fn launch(
     #[cfg(not(feature = "tls"))]
     crate::tls::server_config(&config.tls)?;
 
+    fit_grace_to_autumn(&mut config, state);
     let (routes, health) = build_routes(state, pending, &config, development, shared, user_names)?;
     let health_names = user_names.iter().map(|n| (*n).to_owned()).collect();
     crate::server::start(

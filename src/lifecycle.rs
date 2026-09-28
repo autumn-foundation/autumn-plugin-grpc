@@ -56,11 +56,11 @@ impl Lifecycle {
         use LifecycleEvent::{BindFailed, Bound, Drained, ServerExited, ShutdownRequested};
         match (self, event) {
             (Self::Idle, Bound) => Some(Self::Serving),
-            (Self::Idle, BindFailed) => Some(Self::Failed),
-            (Self::Idle, ShutdownRequested) => Some(Self::Stopped),
             (Self::Serving, ShutdownRequested) => Some(Self::Draining),
-            (Self::Serving, ServerExited) => Some(Self::Failed),
-            (Self::Draining, Drained | ServerExited) => Some(Self::Stopped),
+            (Self::Idle, BindFailed) | (Self::Serving, ServerExited) => Some(Self::Failed),
+            (Self::Idle, ShutdownRequested) | (Self::Draining, Drained | ServerExited) => {
+                Some(Self::Stopped)
+            }
             _ => None,
         }
     }

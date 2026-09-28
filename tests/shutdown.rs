@@ -1,6 +1,6 @@
 //! Graceful shutdown: AC7.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 mod common;
 
@@ -50,7 +50,10 @@ async fn aborts_calls_that_outlive_the_grace_period() {
 
     let started = Instant::now();
     handle.shutdown().await;
-    assert!(started.elapsed() < Duration::from_secs(2), "grace bounds shutdown");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "grace bounds shutdown"
+    );
     assert_eq!(handle.state(), Lifecycle::Stopped);
     let ended = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(item) = stream.next().await {
@@ -107,5 +110,24 @@ async fn a_new_connection_works_until_shutdown() {
         })
         .await
         .unwrap();
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_grace_fits_inside_the_autumn_shutdown_budget() {
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.server.shutdown_timeout_secs = 1;
+    let app = autumn_web::test::TestApp::new().config(config);
+    let plugin = common::echo_plugin().configure(|c| c.shutdown_grace_ms = 5_000);
+    let (_http, handle) = common::boot_with(app, plugin);
+    assert_eq!(handle.shutdown_grace(), Duration::from_secs(1));
+    handle.shutdown().await;
+
+    let (_http, handle) = common::boot(common::echo_plugin());
+    assert_eq!(
+        handle.shutdown_grace(),
+        Duration::from_secs(2),
+        "shorter grace is kept"
+    );
     handle.shutdown().await;
 }

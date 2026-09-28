@@ -10,8 +10,8 @@ use crate::server::Shared;
 
 /// `UP` while the server is serving, else `DOWN`. It is in the readiness
 /// group, so a draining instance leaves the load balancer.
-pub(crate) struct GrpcHealthIndicator {
-    pub(crate) shared: Arc<Shared>,
+pub struct GrpcHealthIndicator {
+    pub shared: Arc<Shared>,
 }
 
 impl HealthIndicator for GrpcHealthIndicator {
@@ -34,8 +34,8 @@ impl HealthIndicator for GrpcHealthIndicator {
 }
 
 /// Exposes `grpc_server_*` families on `/actuator/prometheus`.
-pub(crate) struct GrpcMetricsSource {
-    pub(crate) shared: Arc<Shared>,
+pub struct GrpcMetricsSource {
+    pub shared: Arc<Shared>,
 }
 
 impl MetricsSource for GrpcMetricsSource {

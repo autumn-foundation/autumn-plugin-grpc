@@ -107,6 +107,7 @@ impl<'de> Deserialize<'de> for Toggle {
 /// For each `*_ms` duration, `0` means "not set" (the tonic default).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // independent switches, as in TOML
 pub struct GrpcConfig {
     /// Start the server. Default: `true`.
     pub enabled: bool,

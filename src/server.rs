@@ -27,13 +27,13 @@ use crate::lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 use crate::metrics::Metrics;
 
 /// State shared by the plugin, its hooks and every [`GrpcHandle`].
-pub(crate) struct Shared {
-    pub(crate) lifecycle: LifecycleCell,
-    pub(crate) local_addr: OnceLock<SocketAddr>,
-    pub(crate) health: OnceLock<HealthReporter>,
+pub struct Shared {
+    pub lifecycle: LifecycleCell,
+    pub local_addr: OnceLock<SocketAddr>,
+    pub health: OnceLock<HealthReporter>,
     /// Names reported by the health service (user services only).
-    pub(crate) health_names: OnceLock<Vec<String>>,
-    pub(crate) metrics: Arc<Metrics>,
+    pub health_names: OnceLock<Vec<String>>,
+    pub metrics: Arc<Metrics>,
     grace_ms: AtomicU64,
     /// Ends the accept loop and starts tonic's graceful shutdown.
     stop: CancellationToken,
@@ -44,7 +44,7 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             lifecycle: LifecycleCell::new(),
             local_addr: OnceLock::new(),
@@ -82,7 +82,7 @@ impl Shared {
 /// yourself to drain earlier.
 #[derive(Clone)]
 pub struct GrpcHandle {
-    pub(crate) shared: Arc<Shared>,
+    shared: Arc<Shared>,
 }
 
 impl std::fmt::Debug for GrpcHandle {
@@ -95,6 +95,11 @@ impl std::fmt::Debug for GrpcHandle {
 }
 
 impl GrpcHandle {
+    #[allow(clippy::redundant_pub_crate)] // `GrpcHandle` is public; this must not be.
+    pub(crate) const fn new(shared: Arc<Shared>) -> Self {
+        Self { shared }
+    }
+
     /// The bound address. `None` before start. With port `0`, this is the
     /// real port.
     #[must_use]
@@ -113,6 +118,13 @@ impl GrpcHandle {
     #[must_use]
     pub fn health_reporter(&self) -> Option<HealthReporter> {
         self.shared.health.get().cloned()
+    }
+
+    /// The drain time that [`shutdown`](Self::shutdown) allows. It is
+    /// `shutdown_grace_ms`, capped by Autumn's `server.shutdown_timeout_secs`.
+    #[must_use]
+    pub fn shutdown_grace(&self) -> Duration {
+        self.shared.grace()
     }
 
     /// The current `grpc_server_*` metric families.
@@ -187,17 +199,17 @@ impl GrpcHandle {
 }
 
 /// Everything [`start`] needs.
-pub(crate) struct Launch {
-    pub(crate) config: GrpcConfig,
-    pub(crate) routes: Routes,
-    pub(crate) health: Option<HealthReporter>,
-    pub(crate) health_names: Vec<String>,
+pub struct Launch {
+    pub config: GrpcConfig,
+    pub routes: Routes,
+    pub health: Option<HealthReporter>,
+    pub health_names: Vec<String>,
     #[cfg(feature = "tls")]
-    pub(crate) tls: Option<tonic::transport::ServerTlsConfig>,
+    pub tls: Option<tonic::transport::ServerTlsConfig>,
 }
 
 /// Bind the listener and spawn the server task.
-pub(crate) async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, GrpcError> {
+pub async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<SocketAddr, GrpcError> {
     let Launch {
         config,
         routes,
@@ -213,7 +225,9 @@ pub(crate) async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<Socket
         .map_err(|source| GrpcError::Bind { addr, source })?;
 
     let mut builder = tonic::transport::Server::builder()
-        .max_concurrent_streams((config.max_concurrent_streams > 0).then_some(config.max_concurrent_streams))
+        .max_concurrent_streams(
+            (config.max_concurrent_streams > 0).then_some(config.max_concurrent_streams),
+        )
         .http2_keepalive_interval(config.http2_keepalive_interval())
         .trace_fn(|request| tracing::info_span!("grpc", path = %request.uri().path()));
     if config.concurrency_limit_per_connection > 0 {
@@ -230,7 +244,9 @@ pub(crate) async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<Socket
     }
     #[cfg(feature = "tls")]
     if let Some(tls) = tls {
-        builder = builder.tls_config(tls).map_err(|e| GrpcError::Tls(e.to_string()))?;
+        builder = builder
+            .tls_config(tls)
+            .map_err(|e| GrpcError::Tls(e.to_string()))?;
     }
 
     let incoming = TcpIncoming::from(listener)
@@ -244,9 +260,13 @@ pub(crate) async fn start(shared: &Arc<Shared>, launch: Launch) -> Result<Socket
     .map(move |accepted| accepted.map(|stream| Killable::new(stream, kill.clone())));
 
     if let Some(reporter) = &health {
-        reporter.set_service_status("", ServingStatus::Serving).await;
+        reporter
+            .set_service_status("", ServingStatus::Serving)
+            .await;
         for name in &health_names {
-            reporter.set_service_status(name, ServingStatus::Serving).await;
+            reporter
+                .set_service_status(name, ServingStatus::Serving)
+                .await;
         }
         let _ = shared.health.set(reporter.clone());
     }
@@ -304,10 +324,9 @@ impl<S: Stream + Unpin> Stream for StopOnCancel<S> {
         if this.stop.poll(cx).is_ready() {
             *this.inner = None;
         }
-        match this.inner.as_mut() {
-            Some(inner) => inner.poll_next_unpin(cx),
-            None => Poll::Ready(None),
-        }
+        this.inner
+            .as_mut()
+            .map_or(Poll::Ready(None), |inner| inner.poll_next_unpin(cx))
     }
 }
 

@@ -1,6 +1,12 @@
 //! Shared test fixtures: the generated `Echo` service and helpers.
 
-#![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    dead_code,
+    unused_imports,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    missing_docs
+)]
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -47,7 +53,7 @@ impl Echo for EchoImpl {
         let from_state = request
             .extensions()
             .get::<AppState>()
-            .and_then(|state| state.extension::<Prefix>())
+            .and_then(AppState::extension::<Prefix>)
             .map(|prefix| prefix.0.clone())
             .unwrap_or_default();
         let fixed = self.fixed.clone().unwrap_or_default();

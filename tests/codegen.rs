@@ -1,7 +1,7 @@
 //! Checks that the checked-in code in `tests/generated/` matches
 //! `proto/echo.proto`. Set `UPDATE_GENERATED=1` to write new files.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use std::path::{Path, PathBuf};
 
@@ -36,8 +36,9 @@ fn generated_code_is_fresh() {
     generate(&scratch);
     for file in ["autumn.echo.v1.rs", "echo_descriptor.bin"] {
         let fresh = std::fs::read(scratch.join(file)).unwrap();
-        let stored = std::fs::read(checked_in.join(file))
-            .unwrap_or_else(|_| panic!("missing tests/generated/{file}; run with UPDATE_GENERATED=1"));
+        let stored = std::fs::read(checked_in.join(file)).unwrap_or_else(|_| {
+            panic!("missing tests/generated/{file}; run with UPDATE_GENERATED=1")
+        });
         assert!(
             fresh == stored,
             "tests/generated/{file} is stale; run with UPDATE_GENERATED=1"
