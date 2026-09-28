@@ -220,13 +220,16 @@ async fn health_follows_autumn_readiness() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn draining_refuses_new_connections_and_reports_down() {
-    let (http, handle) = boot(common::echo_plugin());
+    // The stream and the grace must outlive the connect probe. On Windows,
+    // a refused connect returns only after about 2 s of SYN retries.
+    let plugin = common::echo_plugin().configure(|c| c.shutdown_grace_ms = 30_000);
+    let (http, handle) = boot(plugin);
     let addr = handle.local_addr().unwrap();
     let mut client = EchoClient::new(channel(&handle).await);
     let mut stream = client
         .ticks(pb::TicksRequest {
-            count: 40,
-            interval_ms: 25,
+            count: 2_000,
+            interval_ms: 10,
         })
         .await
         .unwrap()
@@ -268,7 +271,16 @@ async fn draining_refuses_new_connections_and_reports_down() {
         .unwrap();
     assert!(up.samples[0].value.abs() < f64::EPSILON);
 
-    let rest: Vec<u32> = stream.map(|t| t.unwrap().index).collect().await;
-    assert_eq!(rest.len(), 39, "the in-flight stream completes");
-    shutdown.await.unwrap();
+    // The in-flight stream still gets ticks during the drain.
+    for _ in 0..3 {
+        stream.next().await.unwrap().unwrap();
+    }
+    assert_eq!(handle.state(), Lifecycle::Draining);
+    // The drain ends when the last call ends.
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("the drain ends after the last call")
+        .unwrap();
+    assert_eq!(handle.state(), Lifecycle::Stopped);
 }
