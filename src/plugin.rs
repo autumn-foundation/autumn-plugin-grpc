@@ -853,7 +853,10 @@ mod tests {
             reflection: Toggle::Off,
             ..GrpcConfig::default()
         };
-        assert!(shared_warnings(&config, "0.0.0.0", false).is_empty());
+        assert_eq!(
+            shared_warnings(&config, "0.0.0.0", false),
+            Vec::<String>::new()
+        );
 
         config.bind = "127.0.0.1:0".to_owned();
         config.max_connection_age_ms = 5;
