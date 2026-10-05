@@ -309,18 +309,26 @@ fn reject(error: ClientError) -> AutumnError {
     AutumnError::from(error)
 }
 
-impl FromRequestParts<AppState> for GrpcClients {
-    type Rejection = AutumnError;
-
-    async fn from_request_parts(
-        parts: &mut http::request::Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+impl GrpcClients {
+    /// The registry with the context of this request. The work is
+    /// synchronous, so the extractors return a ready future.
+    fn extract(parts: &http::request::Parts, state: &AppState) -> Result<Self, AutumnError> {
         let clients = Self::from_state(state).map_err(reject)?;
         Ok(Self {
             registry: clients.registry.clone(),
             context: Some(Arc::new(CallContext::from_request(parts, state))),
         })
+    }
+}
+
+impl FromRequestParts<AppState> for GrpcClients {
+    type Rejection = AutumnError;
+
+    fn from_request_parts(
+        parts: &mut http::request::Parts,
+        state: &AppState,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::extract(parts, state))
     }
 }
 
@@ -335,12 +343,13 @@ pub struct GrpcClient<T>(pub T);
 impl<T: Send + 'static> FromRequestParts<AppState> for GrpcClient<T> {
     type Rejection = AutumnError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut http::request::Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let clients = GrpcClients::from_request_parts(parts, state).await?;
-        clients.only::<T>().map(GrpcClient).map_err(reject)
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let client = GrpcClients::extract(parts, state)
+            .and_then(|clients| clients.only::<T>().map(GrpcClient).map_err(reject));
+        std::future::ready(client)
     }
 }
 
