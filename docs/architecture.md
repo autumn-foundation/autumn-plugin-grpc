@@ -14,6 +14,13 @@
 | `src/registry.rs` | `GrpcServers`: all servers of an app, and the one Autumn `MetricsSource`. |
 | `src/tls.rs` | TLS config from files (feature `tls`). |
 | `src/error.rs` | `GrpcError`: startup failures. |
+| `src/timeout.rs` | `grpc-timeout`: parse and encode. |
+| `src/client/mod.rs` | Feature `client`: `GrpcClients` registry and extractor, `GrpcClient<T>`, `GrpcPlugin::client*`, boot checks (ADR 0009). |
+| `src/client/channel.rs` | `GrpcChannel`: propagation, deadline and metrics around a tonic `Channel`. |
+| `src/client/context.rs` | Request context (request ID, trace headers, deadline) and the request-start gate. |
+| `src/client/status.rs` | `tonic::Status` → `AutumnError` code map, `.or_http()`. |
+| `src/client/metrics.rs` | `grpc_client_*` metrics. |
+| `src/client/memory.rs` | In-memory test doubles over `tokio::io::duplex`. |
 
 ## Boot
 
@@ -75,6 +82,36 @@ tokens, then ends the open bodies.
 User layers wrap only user services. axum applies a layer only to the
 routes that exist when the code calls `layer`. The plugin adds health and
 reflection after the user layers.
+
+## Client call
+
+```mermaid
+sequenceDiagram
+    participant R as HTTP request
+    participant G as request-start gate
+    participant H as handler
+    participant X as GrpcClient extractor
+    participant C as GrpcChannel
+    participant S as downstream service
+    R->>G: record start time (before Autumn's timeout)
+    G->>H: Autumn middleware, then the handler
+    H->>X: extract
+    X->>X: request ID, traceparent, deadline = start + request_timeout_ms
+    X-->>H: client over GrpcChannel (with context)
+    H->>C: call
+    C->>C: add metadata (caller values stay)
+    C->>C: grpc-timeout = min(client timeout, time left, caller timeout)
+    alt no time left
+        C-->>H: DEADLINE_EXCEEDED (not sent)
+    else
+        C->>S: lazy tonic Channel (TCP, TLS or in-memory double)
+        S-->>C: response or status
+        C-->>H: reply, or Status (timeout: DEADLINE_EXCEEDED)
+    end
+    H->>H: .or_http()? maps Status to HTTP
+```
+
+Each call goes into `grpc_client_*` metrics when its response body ends.
 
 ## Shutdown
 

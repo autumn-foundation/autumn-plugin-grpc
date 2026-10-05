@@ -99,6 +99,8 @@ pub struct GrpcPlugin {
     descriptors: Vec<&'static [u8]>,
     posture: Posture,
     shared: Arc<Shared>,
+    #[cfg(feature = "client")]
+    pub(crate) clients: crate::client::Registrations,
 }
 
 impl Default for GrpcPlugin {
@@ -132,6 +134,8 @@ impl GrpcPlugin {
             descriptors: Vec::new(),
             posture: Posture::Unclassified,
             shared: Arc::new(Shared::new()),
+            #[cfg(feature = "client")]
+            clients: crate::client::Registrations::default(),
         }
     }
 
@@ -306,7 +310,7 @@ impl GrpcPlugin {
         routes
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.resolved = OnceLock::new();
     }
 
@@ -383,9 +387,13 @@ impl GrpcPlugin {
 
     fn resolved(&self) -> &Result<Resolved, ConfigError> {
         self.resolved.get_or_init(|| {
+            #[cfg(feature = "client")]
+            let clients = self.clients.names();
+            #[cfg(not(feature = "client"))]
+            let clients: Vec<&str> = Vec::new();
             let mut resolved = match &self.explicit {
                 Some(config) => Resolved::explicit((**config).clone()),
-                None => GrpcConfig::resolve(&self.section)?,
+                None => GrpcConfig::resolve_with_clients(&self.section, &clients)?,
             };
             for apply in &self.overrides {
                 apply(&mut resolved.config);
@@ -562,6 +570,13 @@ impl Plugin for GrpcPlugin {
         if let Some(error) = problem {
             return fail_at_startup(app, shared, &GrpcError::Config(error));
         }
+        // Clients do not need the server, so they come before `enabled`.
+        #[cfg(feature = "client")]
+        let app = match crate::client::prepare(&app, std::mem::take(&mut self.clients), &config) {
+            Ok(Some(prepared)) => prepared.install(app),
+            Ok(None) => app,
+            Err(error) => return fail_at_startup(app, shared, &error),
+        };
         if !config.enabled {
             tracing::info!(section = %self.section, "gRPC server disabled by configuration");
             return app;

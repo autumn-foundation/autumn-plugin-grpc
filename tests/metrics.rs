@@ -274,3 +274,82 @@ async fn the_in_flight_gauge_counts_open_calls() {
     );
     handle.shutdown().await;
 }
+
+/// Client labels: the client name comes from code, a bad method name is
+/// `unknown`, and `max_metric_series` caps label sets for each client.
+#[cfg(feature = "client")]
+#[tokio::test(flavor = "multi_thread")]
+async fn client_labels_are_bounded() {
+    use autumn_plugin_grpc::{GrpcChannel, GrpcClients};
+
+    let mut config = common::local_config();
+    config.enabled = false;
+    config.max_metric_series = 2;
+    let plugin = autumn_plugin_grpc::GrpcPlugin::new()
+        .config(config)
+        .development(true)
+        .client("echo", tonic::client::Grpc::new)
+        .client_double("echo", common::EchoServer::new(common::EchoImpl::default()));
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<GrpcClients>));
+    let seen = slot.clone();
+    let route = axum::routing::get(move |clients: GrpcClients| {
+        let seen = seen.clone();
+        async move {
+            *seen.lock().unwrap() = Some(clients);
+        }
+    });
+    let http = autumn_web::test::TestApp::new()
+        .merge(axum::Router::new().route("/clients", route))
+        .plugin(plugin)
+        .build();
+    assert_eq!(http.get("/clients").send().await.status, 200);
+    let clients = slot.lock().unwrap().clone().unwrap();
+    let mut grpc = clients
+        .get::<tonic::client::Grpc<GrpcChannel>>("echo")
+        .unwrap();
+    for path in [
+        "/autumn.echo.v1.Echo/Say",
+        "/autumn.echo.v1.Echo/bad-name!",
+        "/autumn.echo.v1.Echo/Other1",
+        "/autumn.echo.v1.Echo/Other2",
+    ] {
+        grpc.ready().await.unwrap();
+        let codec = tonic_prost::ProstCodec::<pb::SayRequest, pb::SayReply>::default();
+        let _ = grpc
+            .unary(
+                Request::new(pb::SayRequest::default()),
+                path.parse().unwrap(),
+                codec,
+            )
+            .await;
+    }
+    let families = clients.metric_families();
+    let handled = families
+        .iter()
+        .find(|f| f.name == "grpc_client_handled_total")
+        .unwrap();
+    assert_eq!(handled.samples.len(), 3, "{:?}", handled.samples);
+    let ok = [
+        ("client", "echo"),
+        ("grpc_method", "Say"),
+        ("grpc_code", "OK"),
+    ];
+    assert_eq!(
+        sample(&families, "grpc_client_handled_total", &ok),
+        Some(1.0)
+    );
+    let bad = [("grpc_method", "unknown"), ("grpc_code", "UNIMPLEMENTED")];
+    assert_eq!(
+        sample(&families, "grpc_client_handled_total", &bad),
+        Some(1.0)
+    );
+    let over = [("grpc_service", "other"), ("grpc_method", "other")];
+    assert_eq!(
+        sample(&families, "grpc_client_handled_total", &over),
+        Some(2.0)
+    );
+    assert_eq!(
+        sample(&families, "grpc_client_in_flight", &[("client", "echo")]),
+        Some(0.0)
+    );
+}

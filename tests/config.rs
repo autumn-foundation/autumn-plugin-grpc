@@ -448,3 +448,139 @@ fn shared_mode_without_the_multiplex_feature_stops_boot() {
     assert!(message.contains("multiplex"), "{message}");
     assert_eq!(handle.state(), autumn_plugin_grpc::Lifecycle::Failed);
 }
+
+// ── Clients (issue #3, AC1 and AC2) ─────────────────────────────────────
+
+#[test]
+fn client_defaults_are_safe() {
+    let client = autumn_plugin_grpc::ClientConfig::default();
+    assert_eq!(client.endpoint, "");
+    assert_eq!(client.timeout(), Some(Duration::from_secs(10)));
+    assert_eq!(client.connect_timeout(), Duration::from_secs(5));
+    assert_eq!(client.tls.ca_path, "");
+    assert!(GrpcConfig::default().clients.is_empty());
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn clients_parse_from_toml() {
+    let text = r#"
+        [grpc.clients.billing]
+        endpoint = "http://billing:50051"
+        timeout_ms = 0
+        connect_timeout_ms = 250
+
+        [grpc.clients.ledger]
+        endpoint = "http://10.0.0.5:7000"
+    "#;
+    let config = GrpcConfig::from_toml_str(text, "grpc").unwrap();
+    let billing = &config.clients["billing"];
+    assert_eq!(billing.endpoint, "http://billing:50051");
+    assert_eq!(billing.timeout(), None, "0: off");
+    assert_eq!(billing.connect_timeout(), Duration::from_millis(250));
+    assert_eq!(config.clients["ledger"].timeout_ms, 10_000);
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn bad_client_values_are_rejected() {
+    for (text, needle) in [
+        ("[grpc.clients.a]\nendpoint = \"not a uri\"", "endpoint"),
+        ("[grpc.clients.a]\nendpoint = \"ftp://host:1\"", "http"),
+        ("[grpc.clients.a]\nendpoint = \"http://\"", "endpoint"),
+        ("[grpc.clients.a]\nendpoint = \"http://h:1/v1\"", "path"),
+        ("[grpc.clients.a]\nendpoint = \"http://h:1?x=1\"", "path"),
+        (
+            "[grpc.clients.a]\nendpoint = \"http://h:1\"\nconnect_timeout_ms = 0",
+            "connect_timeout_ms",
+        ),
+        (
+            "[grpc.clients.Bad-Name]\nendpoint = \"http://h:1\"",
+            "Bad-Name",
+        ),
+        (
+            "[grpc.clients.a]\nendpoint = \"http://h:1\"\nnope = 1",
+            "nope",
+        ),
+        (
+            "[grpc.clients.a]\nendpoint = \"http://h:1\"\n[grpc.clients.a.tls]\nca_path = \"ca.pem\"",
+            "https",
+        ),
+        (
+            "[grpc.clients.a]\nendpoint = \"https://h:1\"\n[grpc.clients.a.tls]\nca_path = \"c\"\ncert_path = \"x\"",
+            "key_path",
+        ),
+        (
+            "[grpc.clients.a]\nendpoint = \"https://h:1\"\n[grpc.clients.a.tls]\nca_path = \"c\"\nkey_path = \"x\"",
+            "cert_path",
+        ),
+    ] {
+        let error = GrpcConfig::from_toml_str(text, "grpc").unwrap_err();
+        assert!(error.message().contains(needle), "{text}: {error}");
+    }
+}
+
+#[cfg(all(feature = "client", feature = "tls"))]
+#[test]
+fn https_needs_a_ca_bundle() {
+    let error = GrpcConfig::from_toml_str("[grpc.clients.a]\nendpoint = \"https://h:1\"", "grpc")
+        .unwrap_err();
+    assert!(error.message().contains("ca_path"), "{error}");
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn client_settings_use_the_same_layers() {
+    let dir = temp_dir("clients");
+    std::fs::write(
+        dir.join("autumn.toml"),
+        r#"
+        [grpc.clients.billing]
+        endpoint = "http://billing:1"
+        timeout_ms = 100
+
+        [profile.prod.grpc.clients.billing]
+        timeout_ms = 200
+        "#,
+    )
+    .unwrap();
+    let env = env_for(&dir)
+        .with("AUTUMN_ENV", "prod")
+        .with(
+            "AUTUMN_GRPC__CLIENTS__BILLING__ENDPOINT",
+            "http://billing:2",
+        )
+        .with("AUTUMN_GRPC__CLIENTS__LEDGER__ENDPOINT", "http://ledger:3");
+    let resolved = GrpcConfig::resolve_with_env("grpc", &env).unwrap();
+    let billing = &resolved.config().clients["billing"];
+    assert_eq!(billing.endpoint, "http://billing:2", "env wins");
+    assert_eq!(billing.timeout_ms, 200, "profile applies");
+    assert!(
+        !resolved.config().clients.contains_key("ledger"),
+        "no file entry and not registered: no leaf to read"
+    );
+
+    // A name from code gets env leaves, with no file entry.
+    let resolved = GrpcConfig::resolve_with_env_and_clients("grpc", &env, &["ledger"]).unwrap();
+    assert_eq!(
+        resolved.config().clients["ledger"].endpoint,
+        "http://ledger:3"
+    );
+
+    let bad = env_for(&dir).with("AUTUMN_GRPC__CLIENTS__BILLING__TIMEOUT_MS", "soon");
+    let error = GrpcConfig::resolve_with_env("grpc", &bad).unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("AUTUMN_GRPC__CLIENTS__BILLING__TIMEOUT_MS"),
+        "{error}"
+    );
+}
+
+#[cfg(not(feature = "client"))]
+#[test]
+fn clients_without_the_feature_stop_boot() {
+    let error = GrpcConfig::from_toml_str("[grpc.clients.a]\nendpoint = \"http://h:1\"", "grpc")
+        .unwrap_err();
+    assert!(error.message().contains("`client` feature"), "{error}");
+}

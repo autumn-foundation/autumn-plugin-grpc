@@ -19,6 +19,9 @@ tls = ["tonic/tls-ring"]
 # HTTP/2 (h2c) in axum for the whole app. `autumn-web/ws` gives the
 # server shutdown signal (`AppState::shutdown_token`).
 multiplex = ["axum/http2", "autumn-web/ws"]
+# Call gRPC services from Autumn handlers: `GrpcClient<T>`, `GrpcClients`
+# and `[grpc.clients.<name>]`. The server does not need it.
+client = ["tonic/channel", "dep:hyper-util"]
 
 [dependencies]
 # Core surface only. Cargo unifies features with the host app.
@@ -28,6 +31,7 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 http-body = "1"
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 pin-project-lite = "0.2"
 prost = "0.14"
 prost-types = "0.14"
@@ -63,6 +67,11 @@ tonic-prost-build = "0.14"
 [[example]]
 name = "echo"
 path = "examples/echo.rs"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
+required-features = ["client"]
 
 [lints.rust]
 unsafe_code = "forbid"

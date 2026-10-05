@@ -201,6 +201,7 @@ dependencies = [
  "h2",
  "http",
  "http-body",
+ "hyper-util",
  "pin-project-lite",
  "proptest",
  "prost",

@@ -6,13 +6,14 @@ gRPC plugin for the Autumn web framework, built on tonic 0.14. One crate:
 ## Commands
 
 - Format: `cargo fmt --all` (CI: `--check`)
-- Lint: `cargo clippy --all-targets --features tls,multiplex -- -D warnings`
+- Lint: `cargo clippy --all-targets --features tls,multiplex,client -- -D warnings`
   (pedantic + nursery are on in `Cargo.toml`). Also run it with no features.
-- Test: `cargo test` and `cargo test --features tls,multiplex`
-- Coverage: `cargo llvm-cov --features tls,multiplex --fail-under-lines 85`
+- Test: `cargo test` and `cargo test --features tls,multiplex,client`
+- Coverage: `cargo llvm-cov --features tls,multiplex,client --fail-under-lines 85`
 - Regenerate test code from `proto/echo.proto`:
   `UPDATE_GENERATED=1 cargo test --test codegen`
-- Example: `cargo run --example echo`
+- Examples: `cargo run --example echo`,
+  `cargo run --example client --features client`
 - Pre-commit hook: `git config core.hooksPath .githooks`
 
 No `protoc` is necessary. `tests/codegen.rs` uses `protox`.
@@ -23,7 +24,9 @@ See `docs/architecture.md`. `plugin.rs` (builder, `Plugin`, route
 assembly), `config.rs`, `server.rs` (listener, `GrpcHandle`, drain),
 `lifecycle.rs`, `metrics.rs`, `registry.rs` (`GrpcServers`, the one
 metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
-`tls.rs`, `error.rs`.
+`tls.rs`, `error.rs`, `timeout.rs` (`grpc-timeout`). `client/` (feature
+`client`, ADR 0009): `mod.rs` (registry, extractors, boot checks),
+`channel.rs`, `context.rs`, `status.rs`, `metrics.rs`, `memory.rs`.
 
 ## Rules
 
@@ -43,6 +46,14 @@ metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
 - **Metric labels stay bounded.** A method label needs a descriptor or an
   `OK` response. New labels need a bound and a test in `tests/metrics.rs`.
   Names must not start with `autumn_`.
+- **Clients do not need the server.** Install them before the
+  `enabled` check in `Plugin::build`. No client code without the
+  `client` feature.
+- **Client calls keep caller values.** Add metadata only when absent.
+  `grpc-timeout` is the smallest value. A timeout is
+  `DEADLINE_EXCEEDED`, never `CANCELLED`. Tests: `tests/client.rs`.
+- **Status to HTTP:** 4xx text is fixed; never put the downstream
+  message in it. 5xx text can have it (Autumn hides it outside `dev`).
 - **Config:** a new key goes in `config.rs` with a safe default, a doc
   comment, validation if a value can fail, and a line in the README TOML
   block. Env overrides come from the leaf keys. Use `0`/`""` for "unset",
@@ -50,7 +61,8 @@ metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
 - **Startup errors abort boot.** Return `GrpcError` from the startup hook.
   Never fall back silently (for example, to plain text). A bad env
   override is an error too.
-- **Tests:** pin `.development(..)` on each plugin that boots. Wait with
+- **Tests:** pin `.development(..)` on each plugin that boots. Point
+  clients at `client_double`, not at a port. Wait with
   `common::settle` or `common::eventually`, not a fixed sleep.
 - No `unwrap`/`expect`/`panic!` in library code. Tests may use them.
 - No behavior without a test. Record decisions in `docs/adr/NNNN-*.md`.

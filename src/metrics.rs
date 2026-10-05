@@ -29,7 +29,7 @@ use futures_util::future::BoxFuture;
 use http::{HeaderMap, Request, Response};
 use http_body::Frame;
 
-const UNKNOWN: &str = "unknown";
+pub const UNKNOWN: &str = "unknown";
 const OTHER: &str = "other";
 
 /// Metric families this module emits.
@@ -42,7 +42,7 @@ pub mod names {
 }
 
 /// The canonical name of a gRPC status code.
-const fn code_name(code: i32) -> &'static str {
+pub const fn code_name(code: i32) -> &'static str {
     match code {
         0 => "OK",
         1 => "CANCELLED",
@@ -64,7 +64,7 @@ const fn code_name(code: i32) -> &'static str {
     }
 }
 
-fn status_in(headers: &HeaderMap) -> Option<i32> {
+pub fn status_in(headers: &HeaderMap) -> Option<i32> {
     headers
         .get("grpc-status")
         .and_then(|value| value.to_str().ok())
@@ -74,10 +74,85 @@ fn status_in(headers: &HeaderMap) -> Option<i32> {
 type Handled = HashMap<(String, String, &'static str), u64>;
 type Timed = HashMap<(String, String), (u64, f64)>;
 
+/// Counters by `(service, method, code)` and timers by
+/// `(service, method)`. The server and each client have one.
 #[derive(Default)]
-struct Series {
+pub struct Series {
     handled: Handled,
     timed: Timed,
+}
+
+/// Samples of one [`Series`]: handled, time sums and time counts.
+pub struct Samples {
+    pub handled: Vec<MetricSample>,
+    pub sums: Vec<MetricSample>,
+    pub counts: Vec<MetricSample>,
+}
+
+impl Series {
+    /// Count one call. After `max_series` label sets, a new set is
+    /// `other`. The code stays.
+    pub fn record(
+        &mut self,
+        service: String,
+        method: String,
+        code: &'static str,
+        seconds: f64,
+        max_series: usize,
+    ) {
+        let mut key = (service, method, code);
+        if !self.handled.contains_key(&key) && self.handled.len() >= max_series {
+            key = (OTHER.to_owned(), OTHER.to_owned(), code);
+        }
+        let timed_key = (key.0.clone(), key.1.clone());
+        *self.handled.entry(key).or_default() += 1;
+        let timed = self.timed.entry(timed_key).or_default();
+        timed.0 += 1;
+        timed.1 += seconds;
+    }
+
+    /// Samples with `grpc_service`, `grpc_method` (and `grpc_code`)
+    /// labels, sorted by labels.
+    pub fn samples(&self) -> Samples {
+        let mut handled: Vec<MetricSample> = self
+            .handled
+            .iter()
+            .map(|((service, method, code), count)| MetricSample {
+                labels: vec![
+                    ("grpc_service".to_owned(), service.clone()),
+                    ("grpc_method".to_owned(), method.clone()),
+                    ("grpc_code".to_owned(), (*code).to_owned()),
+                ],
+                #[allow(clippy::cast_precision_loss)] // counts stay far below 2^52
+                value: *count as f64,
+            })
+            .collect();
+        handled.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let mut sums = Vec::with_capacity(self.timed.len());
+        let mut counts = Vec::with_capacity(self.timed.len());
+        for ((service, method), (count, sum)) in &self.timed {
+            let labels = vec![
+                ("grpc_service".to_owned(), service.clone()),
+                ("grpc_method".to_owned(), method.clone()),
+            ];
+            sums.push(MetricSample {
+                labels: labels.clone(),
+                value: *sum,
+            });
+            counts.push(MetricSample {
+                labels,
+                #[allow(clippy::cast_precision_loss)]
+                value: *count as f64,
+            });
+        }
+        sums.sort_by(|a, b| a.labels.cmp(&b.labels));
+        counts.sort_by(|a, b| a.labels.cmp(&b.labels));
+        Samples {
+            handled,
+            sums,
+            counts,
+        }
+    }
 }
 
 struct Settings {
@@ -175,62 +250,28 @@ impl Metrics {
         UNKNOWN.to_owned()
     }
 
-    // False positive: `timed` borrows the guard until the last line.
-    #[allow(clippy::significant_drop_tightening)]
     fn record(&self, service: String, method: String, code: i32, seconds: f64) {
         let code = code_name(code);
         let method = self.method_label(&service, method, code);
         let max_series = self.max_series();
-        let mut series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut key = (service, method, code);
-        if !series.handled.contains_key(&key) && series.handled.len() >= max_series {
-            key = (OTHER.to_owned(), OTHER.to_owned(), code);
-        }
-        let timed_key = (key.0.clone(), key.1.clone());
-        *series.handled.entry(key).or_default() += 1;
-        let timed = series.timed.entry(timed_key).or_default();
-        timed.0 += 1;
-        timed.1 += seconds;
+        self.series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(service, method, code, seconds, max_series);
     }
 
     /// A snapshot as Autumn metric families.
     /// `up` is the `grpc_server_up` value.
     pub fn families(&self, up: bool) -> Vec<MetricFamily> {
-        let series = self.series.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut handled: Vec<MetricSample> = series
-            .handled
-            .iter()
-            .map(|((service, method, code), count)| MetricSample {
-                labels: vec![
-                    ("grpc_service".to_owned(), service.clone()),
-                    ("grpc_method".to_owned(), method.clone()),
-                    ("grpc_code".to_owned(), (*code).to_owned()),
-                ],
-                #[allow(clippy::cast_precision_loss)] // counts stay far below 2^52
-                value: *count as f64,
-            })
-            .collect();
-        handled.sort_by(|a, b| a.labels.cmp(&b.labels));
-        let mut sums = Vec::with_capacity(series.timed.len());
-        let mut counts = Vec::with_capacity(series.timed.len());
-        for ((service, method), (count, sum)) in &series.timed {
-            let labels = vec![
-                ("grpc_service".to_owned(), service.clone()),
-                ("grpc_method".to_owned(), method.clone()),
-            ];
-            sums.push(MetricSample {
-                labels: labels.clone(),
-                value: *sum,
-            });
-            counts.push(MetricSample {
-                labels,
-                #[allow(clippy::cast_precision_loss)]
-                value: *count as f64,
-            });
-        }
-        sums.sort_by(|a, b| a.labels.cmp(&b.labels));
-        counts.sort_by(|a, b| a.labels.cmp(&b.labels));
-        drop(series);
+        let Samples {
+            handled,
+            sums,
+            counts,
+        } = self
+            .series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .samples();
         #[allow(clippy::cast_precision_loss)]
         let in_flight = self.in_flight.load(Ordering::Acquire) as f64;
         let up = if up { 1.0 } else { 0.0 };
@@ -269,7 +310,12 @@ impl Metrics {
     }
 }
 
-fn family(name: &str, help: &str, kind: MetricKind, samples: Vec<MetricSample>) -> MetricFamily {
+pub fn family(
+    name: &str,
+    help: &str,
+    kind: MetricKind,
+    samples: Vec<MetricSample>,
+) -> MetricFamily {
     MetricFamily {
         name: name.to_owned(),
         help: help.to_owned(),
@@ -278,7 +324,7 @@ fn family(name: &str, help: &str, kind: MetricKind, samples: Vec<MetricSample>) 
     }
 }
 
-const fn unlabelled(value: f64) -> MetricSample {
+pub const fn unlabelled(value: f64) -> MetricSample {
     MetricSample {
         labels: Vec::new(),
         value,
@@ -287,7 +333,7 @@ const fn unlabelled(value: f64) -> MetricSample {
 
 /// `true` for a plausible protobuf method name: an ASCII identifier of at
 /// most 64 characters.
-fn is_method_name(name: &str) -> bool {
+pub fn is_method_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -322,15 +368,40 @@ pub fn methods_from_descriptors(sets: &[&[u8]]) -> HashMap<String, HashSet<Strin
     methods
 }
 
+/// What a response body showed about the call status.
+#[derive(Default)]
+pub struct Outcome {
+    /// `grpc-status` in the response headers (trailers-only).
+    pub header_code: Option<i32>,
+    /// `grpc-status` in the trailers.
+    pub trailer_code: Option<i32>,
+    /// The body reached its end (or failed).
+    pub ended: bool,
+}
+
+impl Outcome {
+    /// First the trailers. If they have no status, the headers (a
+    /// trailers-only response). A body that ends with no status is
+    /// UNKNOWN. A body dropped before its end is CANCELLED.
+    pub fn code(&self) -> i32 {
+        self.trailer_code
+            .or(self.header_code)
+            .unwrap_or(if self.ended { 2 } else { 1 })
+    }
+}
+
+/// A call record that a [`TrackedBody`] updates.
+pub trait Observed: Send + 'static {
+    fn outcome(&mut self) -> &mut Outcome;
+}
+
 /// Records one call when dropped.
 struct CallGuard {
     metrics: Arc<Metrics>,
     service: String,
     method: String,
     started: Instant,
-    header_code: Option<i32>,
-    trailer_code: Option<i32>,
-    ended: bool,
+    outcome: Outcome,
 }
 
 impl CallGuard {
@@ -342,26 +413,23 @@ impl CallGuard {
             service,
             method,
             started: Instant::now(),
-            header_code: None,
-            trailer_code: None,
-            ended: false,
+            outcome: Outcome::default(),
         }
+    }
+}
+
+impl Observed for CallGuard {
+    fn outcome(&mut self) -> &mut Outcome {
+        &mut self.outcome
     }
 }
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        // First use the trailers. If they have no status, use the headers
-        // (a trailers-only response). A body that ends with no status is
-        // UNKNOWN. A body that the client drops before its end is CANCELLED.
-        let code = self
-            .trailer_code
-            .or(self.header_code)
-            .unwrap_or(if self.ended { 2 } else { 1 });
         self.metrics.record(
             std::mem::take(&mut self.service),
             std::mem::take(&mut self.method),
-            code,
+            self.outcome.code(),
             self.started.elapsed().as_secs_f64(),
         );
         // Last, so `in_flight == 0` means each call is in the counters.
@@ -371,16 +439,33 @@ impl Drop for CallGuard {
 
 pin_project_lite::pin_project! {
     /// A response body that reports the call status to its guard.
-    struct TrackedBody {
+    pub struct TrackedBody<B, G> {
         #[pin]
-        inner: Body,
-        guard: CallGuard,
+        inner: B,
+        guard: G,
     }
 }
 
-impl http_body::Body for TrackedBody {
+impl<B, G> TrackedBody<B, G> {
+    /// Track `inner`. A body already at its end counts as ended: hyper
+    /// does not poll it.
+    pub fn new(inner: B, mut guard: G) -> Self
+    where
+        B: http_body::Body,
+        G: Observed,
+    {
+        guard.outcome().ended = inner.is_end_stream();
+        Self { inner, guard }
+    }
+}
+
+impl<B, G> http_body::Body for TrackedBody<B, G>
+where
+    B: http_body::Body<Data = bytes::Bytes>,
+    G: Observed,
+{
     type Data = bytes::Bytes;
-    type Error = axum::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -391,11 +476,11 @@ impl http_body::Body for TrackedBody {
         match &polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(trailers) = frame.trailers_ref() {
-                    this.guard.trailer_code = status_in(trailers);
+                    this.guard.outcome().trailer_code = status_in(trailers);
                 }
             }
-            // A body error is not a client cancel: count it as UNKNOWN.
-            Poll::Ready(None | Some(Err(_))) => this.guard.ended = true,
+            // A body error is not a cancel: count it as UNKNOWN.
+            Poll::Ready(None | Some(Err(_))) => this.guard.outcome().ended = true,
             Poll::Pending => {}
         }
         polled
@@ -458,11 +543,9 @@ where
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = future.await?;
-            guard.header_code = status_in(response.headers());
-            // hyper does not poll a body that is already at its end.
-            guard.ended = http_body::Body::is_end_stream(response.body());
+            guard.outcome.header_code = status_in(response.headers());
             let (parts, body) = response.into_parts();
-            let body = Body::new(TrackedBody { inner: body, guard });
+            let body = Body::new(TrackedBody::new(body, guard));
             Ok(Response::from_parts(parts, body))
         })
     }
@@ -509,7 +592,7 @@ mod tests {
         metrics.configure(10, HashSet::from(["a.B".to_owned()]), HashMap::new());
         drop(CallGuard::start(metrics.clone(), "/a.B/C"));
         let mut ended = CallGuard::start(metrics.clone(), "/a.B/C");
-        ended.ended = true;
+        ended.outcome.ended = true;
         drop(ended);
         let series = metrics.series.lock().unwrap();
         // `C` is not known yet (no descriptor, no OK), so it is `unknown`.

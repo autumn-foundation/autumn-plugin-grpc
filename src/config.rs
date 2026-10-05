@@ -17,8 +17,13 @@
 //! [grpc.tls]                 # needs the `tls` feature
 //! cert_path = "certs/server.pem"
 //! key_path = "certs/server.key"
+//!
+//! [grpc.clients.billing]     # needs the `client` feature
+//! endpoint = "http://billing:50051"
+//! timeout_ms = 10000
 //! ```
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -193,6 +198,179 @@ pub struct GrpcConfig {
     pub max_connection_age_ms: u64,
     /// TLS settings. Empty paths mean plain text.
     pub tls: TlsConfig,
+    /// Downstream services to call, by name (`[grpc.clients.<name>]`).
+    /// Needs the `client` feature. The server does not use them.
+    pub clients: BTreeMap<String, ClientConfig>,
+}
+
+/// Settings for one downstream gRPC service (`[grpc.clients.<name>]`).
+/// Needs the `client` feature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ClientConfig {
+    /// `http://host:port` or `https://host:port`, with no path. Empty is
+    /// an error at boot, unless a test double serves the client.
+    pub endpoint: String,
+    /// Longest time for one call. The client sends the smaller of this
+    /// value and the time left on the incoming request as `grpc-timeout`.
+    /// `0`: off. Default: `10000`.
+    pub timeout_ms: u64,
+    /// Longest time to open a connection. Must be more than `0`.
+    /// Default: `5000`.
+    pub connect_timeout_ms: u64,
+    /// TLS for an `https` endpoint. Needs the `tls` feature.
+    pub tls: ClientTls,
+}
+
+/// Client TLS settings. Empty values mean "not set".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ClientTls {
+    /// PEM CA bundle that signs the server certificate. Necessary for
+    /// `https`. A system bundle (for example
+    /// `/etc/ssl/certs/ca-certificates.crt`) works for public services.
+    pub ca_path: String,
+    /// PEM client certificate chain, for mTLS. Needs `key_path`.
+    pub cert_path: String,
+    /// PEM client private key, for mTLS. Needs `cert_path`.
+    pub key_path: String,
+    /// Server name to verify. Empty: the endpoint host.
+    pub domain_name: String,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            timeout_ms: 10_000,
+            connect_timeout_ms: 5_000,
+            tls: ClientTls::default(),
+        }
+    }
+}
+
+impl ClientConfig {
+    /// Per-call timeout. `None` when `timeout_ms` is `0`.
+    #[must_use]
+    pub const fn timeout(&self) -> Option<Duration> {
+        millis(self.timeout_ms)
+    }
+
+    /// Connect timeout.
+    #[must_use]
+    pub const fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms)
+    }
+
+    /// `true` for an `https` endpoint.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        self.endpoint.trim().starts_with("https://")
+    }
+
+    /// Check one client. `name` is the key in `clients`.
+    fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        let key = |field: &str| format!("clients.{name}.{field}");
+        if self.connect_timeout_ms == 0 {
+            return Err(ConfigError(format!(
+                "`{}` must be more than 0",
+                key("connect_timeout_ms")
+            )));
+        }
+        validate_endpoint(&self.endpoint, &key("endpoint"))?;
+        let tls = &self.tls;
+        let has = |value: &str| !value.trim().is_empty();
+        match (has(&tls.cert_path), has(&tls.key_path)) {
+            (true, false) => {
+                return Err(ConfigError(format!(
+                    "`{}` is set, so `{}` is necessary",
+                    key("tls.cert_path"),
+                    key("tls.key_path")
+                )));
+            }
+            (false, true) => {
+                return Err(ConfigError(format!(
+                    "`{}` is set, so `{}` is necessary",
+                    key("tls.key_path"),
+                    key("tls.cert_path")
+                )));
+            }
+            _ => {}
+        }
+        let any_tls =
+            has(&tls.ca_path) || has(&tls.cert_path) || has(&tls.key_path) || has(&tls.domain_name);
+        if !self.is_https() {
+            if any_tls {
+                return Err(ConfigError(format!(
+                    "`{}` needs an https:// endpoint",
+                    key("tls")
+                )));
+            }
+            return Ok(());
+        }
+        if !cfg!(feature = "tls") {
+            return Err(ConfigError(format!(
+                "`{}` uses https, which needs the `tls` feature of autumn-plugin-grpc",
+                key("endpoint")
+            )));
+        }
+        if !has(&tls.ca_path) {
+            return Err(ConfigError(format!(
+                "`{}` is necessary for an https endpoint",
+                key("tls.ca_path")
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A client name is a TOML key and part of an env variable name.
+pub fn validate_client_name(name: &str) -> Result<(), ConfigError> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError(format!(
+            "gRPC client name `{name}` must start with a-z and use only a-z, 0-9 and _ (at most 64)"
+        )))
+    }
+}
+
+/// An empty endpoint is "unset" here. The plugin checks it at boot.
+fn validate_endpoint(endpoint: &str, key: &str) -> Result<(), ConfigError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    let uri: http::Uri = endpoint.parse().map_err(|_| {
+        ConfigError(format!(
+            "`{key}` must be a URI like \"http://host:50051\", found \"{endpoint}\""
+        ))
+    })?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(ConfigError(format!(
+            "`{key}` must start with http:// or https://, found \"{endpoint}\""
+        )));
+    }
+    if uri.host().is_none_or(str::is_empty) {
+        return Err(ConfigError(format!(
+            "`{key}` needs a host, found \"{endpoint}\""
+        )));
+    }
+    let path = uri.path_and_query().map_or("", |p| p.as_str());
+    if !matches!(path, "" | "/") {
+        return Err(ConfigError(format!(
+            "`{key}` must have no path or query, found \"{endpoint}\""
+        )));
+    }
+    Ok(())
 }
 
 /// TLS settings. Needs the `tls` crate feature.
@@ -262,6 +440,7 @@ impl Default for GrpcConfig {
             http2_keepalive_timeout_ms: 20_000,
             max_connection_age_ms: 0,
             tls: TlsConfig::default(),
+            clients: BTreeMap::new(),
         }
     }
 }
@@ -424,12 +603,38 @@ impl GrpcConfig {
         Self::resolve_with_env(section, &env)
     }
 
+    /// Like [`resolve`](Self::resolve), with env leaves for the client
+    /// names from code.
+    pub(crate) fn resolve_with_clients(
+        section: &str,
+        clients: &[&str],
+    ) -> Result<Resolved, ConfigError> {
+        let env = autumn_web::dotenv::os_env_with_dotenv()
+            .map_err(|e| ConfigError(format!("cannot read .env files: {e}")))?;
+        Self::resolve_with_env_and_clients(section, &env, clients)
+    }
+
     /// Like [`resolve`](Self::resolve), but reads only `env`.
     ///
     /// # Errors
     ///
     /// See [`resolve`](Self::resolve).
     pub fn resolve_with_env(section: &str, env: &dyn Env) -> Result<Resolved, ConfigError> {
+        Self::resolve_with_env_and_clients(section, env, &[])
+    }
+
+    /// Like [`resolve_with_env`](Self::resolve_with_env). Env overrides
+    /// apply to each client in the files and to each name in `clients`
+    /// (the plugin passes the names from [`client`](crate::GrpcPlugin)).
+    ///
+    /// # Errors
+    ///
+    /// See [`resolve`](Self::resolve).
+    pub fn resolve_with_env_and_clients(
+        section: &str,
+        env: &dyn Env,
+        clients: &[&str],
+    ) -> Result<Resolved, ConfigError> {
         let (selected, canonical) = resolve_active_profile(env);
         let mut merged = toml::Value::Table(toml::map::Map::new());
 
@@ -457,7 +662,7 @@ impl GrpcConfig {
             return Err(ConfigError(format!("`{section}` must be a table")));
         }
         let mut config = Self::from_section(Some(&section_value))?;
-        apply_env_overrides(section, &mut section_value, &mut config, env)?;
+        apply_env_overrides(section, &mut section_value, &mut config, env, clients)?;
         config.validate()?;
         Ok(Resolved {
             config,
@@ -513,6 +718,15 @@ impl GrpcConfig {
             return Err(ConfigError(
                 "`tls.client_auth_optional` needs `tls.client_ca_path`".to_owned(),
             ));
+        }
+        if !self.clients.is_empty() && !cfg!(feature = "client") {
+            return Err(ConfigError(
+                "`clients` needs the `client` feature of autumn-plugin-grpc".to_owned(),
+            ));
+        }
+        for (name, client) in &self.clients {
+            validate_client_name(name)?;
+            client.validate(name)?;
         }
         if self.listener == Listener::Shared {
             if has(&tls.cert_path) || has(&tls.client_ca_path) {
@@ -593,17 +807,35 @@ fn env_prefix(section: &str) -> String {
 /// Values are TOML literals (`true`, `10`, `"x"`) or bare strings. An
 /// override with the wrong type is an error: a bad value must not leave a
 /// file value (for example `reflection = true`) in place.
+///
+/// A map has no leaves in the defaults. Client leaves come from the names
+/// in the section and in `clients`.
 fn apply_env_overrides(
     section_name: &str,
     section: &mut toml::Value,
     config: &mut GrpcConfig,
     env: &dyn Env,
+    clients: &[&str],
 ) -> Result<(), ConfigError> {
     let defaults =
         toml::Value::try_from(GrpcConfig::default()).map_err(|e| ConfigError(e.to_string()))?;
     let prefix = env_prefix(section_name);
     let mut leaves = Vec::new();
     collect_leaves(&defaults, &mut Vec::new(), &mut leaves);
+    let client_defaults =
+        toml::Value::try_from(ClientConfig::default()).map_err(|e| ConfigError(e.to_string()))?;
+    let mut names: Vec<String> = section
+        .get("clients")
+        .and_then(toml::Value::as_table)
+        .map(|table| table.keys().cloned().collect())
+        .unwrap_or_default();
+    names.extend(clients.iter().map(|name| (*name).to_owned()));
+    names.sort();
+    names.dedup();
+    for name in names {
+        let mut prefix = vec!["clients".to_owned(), name];
+        collect_leaves(&client_defaults, &mut prefix, &mut leaves);
+    }
     for path in leaves {
         let key = format!(
             "{prefix}{}",

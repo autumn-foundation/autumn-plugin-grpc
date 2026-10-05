@@ -25,10 +25,15 @@
 //! - `AppState` in each request's extensions,
 //! - graceful drain on shutdown.
 //!
+//! With the `client` feature, handlers call other gRPC services with
+//! `GrpcClient` and `GrpcClients` (`[grpc.clients.<name>]`).
+//!
 //! See [`GrpcConfig`] for the `[grpc]` section of `autumn.toml`.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "client")]
+mod client;
 mod config;
 mod error;
 mod gate;
@@ -38,9 +43,18 @@ mod metrics;
 mod plugin;
 mod registry;
 mod server;
+mod timeout;
 mod tls;
 
-pub use config::{ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved, TlsConfig, Toggle};
+#[cfg(feature = "client")]
+pub use client::{
+    BoxError, ClientError, GrpcChannel, GrpcClient, GrpcClients, GrpcResultExt, ResponseBody,
+    http_status, status_to_error,
+};
+pub use config::{
+    ClientConfig, ClientTls, ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved,
+    TlsConfig, Toggle,
+};
 pub use error::GrpcError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 pub use plugin::{GrpcPlugin, PLUGIN_NAME, SUPPORTED_AUTUMN_WEB};
