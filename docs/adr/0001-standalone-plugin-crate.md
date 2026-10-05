@@ -14,7 +14,7 @@ tonic 0.14 uses axum 0.8 and hyper 1, the same versions as Autumn 0.7.
 - Publish `autumn-plugin-grpc` with `GrpcPlugin`.
 - Use tonic 0.14 with `default-features = false` and features `server`,
   `router`, `codegen`. Use `tonic-health` and `tonic-reflection`.
-- Depend on `autumn-web = "0.7"` with `default-features = false`.
+- Depend on `autumn-web = "0.8"` with `default-features = false`.
 - Re-export `tonic`, `tonic_health` and `tonic_reflection`.
 
 ## Consequences

@@ -52,7 +52,7 @@ fn defaults_are_production_safe() {
     assert!(config.metrics);
     assert_eq!(config.shutdown_grace_ms, 10_000);
     assert!(config.max_metric_series > 0);
-    assert!(config.tls.cert_path.is_empty());
+    assert_eq!(config.tls.cert_path, "");
     config.validate().unwrap();
 }
 

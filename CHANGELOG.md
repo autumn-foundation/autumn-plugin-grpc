@@ -18,3 +18,6 @@
 - `tls` feature: TLS and mTLS from PEM files.
 - `multiplex` feature and `listener = "shared"`: serve gRPC on Autumn's
   HTTP port (ADR 0008).
+- Requires `autumn-web` 0.8. A plugin on a named section declares its
+  routes with the method `GRPC:<section>`, because Autumn 0.8 refuses
+  duplicate declared routes across plugins.

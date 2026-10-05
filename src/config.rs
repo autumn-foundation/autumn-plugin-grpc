@@ -787,7 +787,10 @@ mod tests {
 
     #[test]
     fn dedicated_only_settings_names_each_changed_key() {
-        assert!(GrpcConfig::default().dedicated_only_settings().is_empty());
+        assert_eq!(
+            GrpcConfig::default().dedicated_only_settings(),
+            Vec::<&str>::new()
+        );
         let setters: [(&str, Setter); 11] = [
             ("bind", |c| c.bind = "127.0.0.1:0".to_owned()),
             ("max_connections", |c| c.max_connections = 1),
