@@ -107,3 +107,21 @@ fn service_names_list_what_was_added() {
     assert_eq!(plugin.service_names(), ["autumn.echo.v1.Echo"]);
     assert!(GrpcPlugin::default().service_names().is_empty());
 }
+
+#[test]
+fn a_named_section_lists_its_own_method() {
+    let admin = common::echo_plugin().config_section("grpc_admin");
+    let routes = manifest(&admin);
+    assert!(routes.iter().all(|r| r.method == "GRPC:grpc_admin"));
+    let main = manifest(&common::echo_plugin());
+    for route in &routes {
+        assert!(
+            !main
+                .iter()
+                .any(|m| m.method == route.method && m.path == route.path),
+            "{} {} collides",
+            route.method,
+            route.path
+        );
+    }
+}

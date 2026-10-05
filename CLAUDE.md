@@ -57,7 +57,7 @@ metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
 - Docs and comments: short, ASD-STE100 style (simple words, active voice,
   short sentences).
 
-## Autumn API notes (0.7.0)
+## Autumn API notes (0.8.0)
 
 - `AppBuilder::run` panics with no typed routes. Plugin routers do not count.
 - `TestApp` runs startup hooks (in a thread, with `block_on`), not shutdown

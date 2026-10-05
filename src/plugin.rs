@@ -263,7 +263,10 @@ impl GrpcPlugin {
 
     /// The gRPC services as `autumn routes` lists them. The method is
     /// `GRPC` and the path is `/<service>/*`. These routes are on the gRPC
-    /// listener, or on the HTTP port in shared mode.
+    /// listener, or on the HTTP port in shared mode. A plugin on a
+    /// non-default section uses the method `GRPC:<section>`. Autumn 0.8
+    /// refuses two plugins that declare the same method and path, and two
+    /// servers can serve one service on different ports.
     #[must_use]
     pub fn route_infos(&self) -> Vec<RouteInfo> {
         let Ok(resolved) = self.resolved() else {
@@ -278,10 +281,15 @@ impl GrpcPlugin {
             Posture::Public => (RouteClassification::Public, None),
             Posture::Gated(label) => (RouteClassification::Gated, Some(label.as_str())),
         };
+        let method = if self.section == DEFAULT_SECTION {
+            "GRPC".to_owned()
+        } else {
+            format!("GRPC:{}", self.section)
+        };
         let mut routes: Vec<RouteInfo> = self
             .service_names
             .iter()
-            .map(|name| grpc_route(name, classification, middleware))
+            .map(|name| grpc_route(&method, name, classification, middleware))
             .collect();
         let mut framework = Vec::new();
         if config.health {
@@ -293,7 +301,7 @@ impl GrpcPlugin {
         routes.extend(
             framework
                 .into_iter()
-                .map(|name| grpc_route(name, RouteClassification::Framework, None)),
+                .map(|name| grpc_route(&method, name, RouteClassification::Framework, None)),
         );
         routes
     }
@@ -392,12 +400,13 @@ impl GrpcPlugin {
 }
 
 fn grpc_route(
+    method: &str,
     service: &str,
     classification: RouteClassification,
     middleware: Option<&str>,
 ) -> RouteInfo {
     RouteInfo {
-        method: "GRPC".to_owned(),
+        method: method.to_owned(),
         path: format!("/{service}/*"),
         handler: format!("autumn_plugin_grpc::{service}"),
         classification,

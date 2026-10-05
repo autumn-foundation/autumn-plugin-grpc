@@ -112,7 +112,10 @@ GrpcPlugin::new()
 
 ### Route listing
 
-`autumn routes` shows each service as `GRPC /<service>/*`:
+`autumn routes` shows each service as `GRPC /<service>/*`. A plugin on a
+named section, such as `grpc_admin`, shows `GRPC:grpc_admin` as the
+method. Autumn 0.8 refuses two plugins that declare the same method and
+path:
 
 | Plugin call | Classification |
 |---|---|
@@ -340,7 +343,7 @@ grpcurl -plaintext -H 'authorization: Bearer demo' \
 
 | autumn-plugin-grpc | autumn-web | tonic | MSRV |
 |---|---|---|---|
-| 0.1 | 0.7 | 0.14 | 1.88 |
+| 0.1 | 0.8 | 0.14 | 1.88 |
 
 ## Documents
 
