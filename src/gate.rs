@@ -179,30 +179,11 @@ fn deadline(server: Option<Duration>, headers: &HeaderMap) -> Option<Duration> {
     let client = headers
         .get("grpc-timeout")
         .and_then(|value| value.to_str().ok())
-        .and_then(parse_grpc_timeout);
+        .and_then(crate::timeout::parse);
     match (server, client) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
-}
-
-/// Parse `grpc-timeout`: at most 8 digits and a unit (`H M S m u n`).
-fn parse_grpc_timeout(value: &str) -> Option<Duration> {
-    let unit = value.chars().last()?;
-    let digits = &value[..value.len() - unit.len_utf8()];
-    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let amount: u64 = digits.parse().ok()?;
-    Some(match unit {
-        'H' => Duration::from_secs(amount * 3600),
-        'M' => Duration::from_secs(amount * 60),
-        'S' => Duration::from_secs(amount),
-        'm' => Duration::from_millis(amount),
-        'u' => Duration::from_micros(amount),
-        'n' => Duration::from_nanos(amount),
-        _ => return None,
-    })
 }
 
 pin_project_lite::pin_project! {
@@ -315,24 +296,6 @@ mod tests {
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
         assert!(peer_info(&unix).is_none());
         assert!(peer_info(&request(Version::HTTP_2, None)).is_none());
-    }
-
-    #[test]
-    fn grpc_timeout_values_parse_as_in_the_spec() {
-        for (value, expected) in [
-            ("3H", Duration::from_secs(3 * 3600)),
-            ("1M", Duration::from_secs(60)),
-            ("42S", Duration::from_secs(42)),
-            ("13m", Duration::from_millis(13)),
-            ("2u", Duration::from_micros(2)),
-            ("82n", Duration::from_nanos(82)),
-            ("99999999S", Duration::from_secs(99_999_999)),
-        ] {
-            assert_eq!(parse_grpc_timeout(value), Some(expected), "{value}");
-        }
-        for value in ["", "S", "123456789S", "5x", "-1S", "1.5S", "5é"] {
-            assert_eq!(parse_grpc_timeout(value), None, "{value}");
-        }
     }
 
     #[test]

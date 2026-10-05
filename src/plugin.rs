@@ -99,6 +99,8 @@ pub struct GrpcPlugin {
     descriptors: Vec<&'static [u8]>,
     posture: Posture,
     shared: Arc<Shared>,
+    #[cfg(feature = "client")]
+    pub(crate) clients: crate::client::Registrations,
 }
 
 impl Default for GrpcPlugin {
@@ -132,6 +134,8 @@ impl GrpcPlugin {
             descriptors: Vec::new(),
             posture: Posture::Unclassified,
             shared: Arc::new(Shared::new()),
+            #[cfg(feature = "client")]
+            clients: crate::client::Registrations::default(),
         }
     }
 
@@ -306,7 +310,7 @@ impl GrpcPlugin {
         routes
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.resolved = OnceLock::new();
     }
 
@@ -382,20 +386,30 @@ impl GrpcPlugin {
     }
 
     fn resolved(&self) -> &Result<Resolved, ConfigError> {
-        self.resolved.get_or_init(|| {
-            let mut resolved = match &self.explicit {
-                Some(config) => Resolved::explicit((**config).clone()),
-                None => GrpcConfig::resolve(&self.section)?,
-            };
-            for apply in &self.overrides {
-                apply(&mut resolved.config);
+        self.resolved.get_or_init(|| self.resolve(None))
+    }
+
+    /// Resolve the config. `env` replaces the process environment (tests).
+    fn resolve(&self, env: Option<&dyn autumn_web::config::Env>) -> Result<Resolved, ConfigError> {
+        #[cfg(feature = "client")]
+        let clients = self.clients.names();
+        #[cfg(not(feature = "client"))]
+        let clients: Vec<&str> = Vec::new();
+        let mut resolved = match (&self.explicit, env) {
+            (Some(config), _) => Resolved::explicit((**config).clone()),
+            (None, Some(env)) => {
+                GrpcConfig::resolve_with_env_and_clients(&self.section, env, &clients)?
             }
-            if let Some(development) = self.development {
-                if development { "dev" } else { "prod" }.clone_into(&mut resolved.profile);
-            }
-            resolved.config.validate()?;
-            Ok(resolved)
-        })
+            (None, None) => GrpcConfig::resolve_with_clients(&self.section, &clients)?,
+        };
+        for apply in &self.overrides {
+            apply(&mut resolved.config);
+        }
+        if let Some(development) = self.development {
+            if development { "dev" } else { "prod" }.clone_into(&mut resolved.profile);
+        }
+        resolved.config.validate()?;
+        Ok(resolved)
     }
 }
 
@@ -562,6 +576,16 @@ impl Plugin for GrpcPlugin {
         if let Some(error) = problem {
             return fail_at_startup(app, shared, &GrpcError::Config(error));
         }
+        // Clients do not need the server, so they come before `enabled`.
+        #[cfg(feature = "client")]
+        let app = {
+            let registrations = std::mem::take(&mut self.clients);
+            match crate::client::prepare(&app, registrations, &config, &self.section) {
+                Ok(Some(prepared)) => prepared.install(app),
+                Ok(None) => app,
+                Err(error) => return fail_at_startup(app, shared, &error),
+            }
+        };
         if !config.enabled {
             tracing::info!(section = %self.section, "gRPC server disabled by configuration");
             return app;
@@ -834,7 +858,7 @@ async fn launch_dedicated(
     Ok(addr)
 }
 
-fn startup_error(error: &GrpcError) -> autumn_web::AutumnError {
+pub fn startup_error(error: &GrpcError) -> autumn_web::AutumnError {
     startup_message(&error.to_string())
 }
 
@@ -846,6 +870,40 @@ fn startup_message(message: &str) -> autumn_web::AutumnError {
 mod tests {
     use super::*;
     use crate::config::Toggle;
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn a_registered_client_reads_env_overrides_and_resets_the_cache() {
+        use autumn_web::config::MockEnv;
+
+        let dir =
+            std::env::temp_dir().join(format!("autumn-grpc-plugin-env-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_str().unwrap_or_default())
+            .with(
+                "AUTUMN_GRPC__CLIENTS__LEDGER__ENDPOINT",
+                "http://ledger:7000",
+            )
+            .with("AUTUMN_GRPC__CLIENTS__LEDGER__TIMEOUT_MS", "250");
+        let plugin = GrpcPlugin::new();
+        let before = plugin.resolve(Some(&env)).map(|r| r.config);
+        assert!(
+            before.is_ok_and(|c| c.clients.is_empty()),
+            "no name, no leaf"
+        );
+
+        // Fill the cache, then register: `client` must reset it.
+        let _ = plugin.effective_config();
+        let plugin = plugin.client("ledger", |channel| channel);
+        assert!(plugin.resolved.get().is_none(), "client() resets the cache");
+        let after = plugin.resolve(Some(&env)).map(|r| r.config);
+        let ledger = after.as_ref().map(|c| c.clients.get("ledger").cloned());
+        assert!(
+            matches!(&ledger, Ok(Some(l)) if l.endpoint == "http://ledger:7000" && l.timeout_ms == 250),
+            "{ledger:?}"
+        );
+    }
 
     #[test]
     fn shared_mode_warns_once_for_ignored_settings() {

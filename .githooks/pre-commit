@@ -2,5 +2,5 @@
 # Enable with: git config core.hooksPath .githooks
 set -e
 cargo fmt --all --check
-cargo clippy --all-targets --features tls,multiplex -- -D warnings
-cargo test --features tls,multiplex --quiet
+cargo clippy --all-targets --features tls,multiplex,client -- -D warnings
+cargo test --features tls,multiplex,client --quiet

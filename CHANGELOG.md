@@ -18,6 +18,13 @@
 - `tls` feature: TLS and mTLS from PEM files.
 - `multiplex` feature and `listener = "shared"`: serve gRPC on Autumn's
   HTTP port (ADR 0008).
+- `client` feature: `GrpcPlugin::client(name, build)`, the
+  `GrpcClient<T>` and `GrpcClients` extractors, and
+  `[grpc.clients.<name>]` (`endpoint`, `timeout_ms`,
+  `connect_timeout_ms`, `tls.*`). Lazy connect. Calls send the request
+  ID, `traceparent` and a `grpc-timeout` from the time left on the
+  request. `.or_http()` maps `tonic::Status` to HTTP. `grpc_client_*`
+  metrics. `client_double` for tests (ADR 0009).
 - Requires `autumn-web` 0.8. A plugin on a named section declares its
   routes with the method `GRPC:<section>`, because Autumn 0.8 refuses
   duplicate declared routes across plugins.

@@ -51,3 +51,33 @@ pub fn server_config(config: &TlsConfig) -> Result<(), GrpcError> {
     }
     Ok(())
 }
+
+/// Build a client TLS config from `[grpc.clients.<name>.tls]`. Read the
+/// files now, so a bad file stops boot.
+///
+/// # Errors
+///
+/// The problem text when a file cannot be read.
+#[cfg(all(feature = "tls", feature = "client"))]
+pub fn client_config(
+    config: &crate::config::ClientTls,
+) -> Result<tonic::transport::ClientTlsConfig, String> {
+    use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+
+    let read = |path: &str| {
+        std::fs::read(path.trim()).map_err(|e| format!("cannot read {}: {e}", path.trim()))
+    };
+    let has = |value: &str| !value.trim().is_empty();
+    let mut tls =
+        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(read(&config.ca_path)?));
+    if has(&config.cert_path) {
+        tls = tls.identity(Identity::from_pem(
+            read(&config.cert_path)?,
+            read(&config.key_path)?,
+        ));
+    }
+    if has(&config.domain_name) {
+        tls = tls.domain_name(config.domain_name.trim());
+    }
+    Ok(tls)
+}

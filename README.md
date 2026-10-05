@@ -4,7 +4,8 @@ gRPC for [Autumn](https://autumn-web.app), built on [tonic](https://docs.rs/toni
 
 Add one plugin. Autumn serves HTTP on its port. The plugin serves gRPC on
 a dedicated HTTP/2 port, or on Autumn's port (see
-[Share Autumn's port](#share-autumns-port)).
+[Share Autumn's port](#share-autumns-port)). Handlers can also call other
+gRPC services (see [Call gRPC services](#call-grpc-services)).
 
 ```rust
 use autumn_plugin_grpc::GrpcPlugin;
@@ -39,6 +40,7 @@ async fn main() {
 | Guards: tower layers and tonic interceptors (user services only) | none |
 | Resource limits: connections, HTTP/2 streams, stream resets | 1000, 200, 1024 |
 | TLS and mTLS | crate feature `tls` |
+| Clients for handlers: `GrpcClient<T>`, `GrpcClients` | off; crate feature `client` |
 
 ## Install
 
@@ -49,6 +51,8 @@ autumn-plugin-grpc = "0.1"
 # autumn-plugin-grpc = { version = "0.1", features = ["tls"] }
 # On Autumn's HTTP port:
 # autumn-plugin-grpc = { version = "0.1", features = ["multiplex"] }
+# To call gRPC services from handlers:
+# autumn-plugin-grpc = { version = "0.1", features = ["client"] }
 ```
 
 The crate re-exports `tonic`, `tonic_health` and `tonic_reflection`. Use
@@ -164,6 +168,17 @@ key_path = ""
 client_ca_path = ""                     # set it to require client certificates
 client_auth_optional = false            # needs client_ca_path
 handshake_timeout_ms = 10000            # must be more than 0
+
+[grpc.clients.billing]                  # needs the `client` feature; one table for each client
+endpoint = "http://billing:50051"       # http:// or https://, no path; necessary
+timeout_ms = 10000                      # each call; 0: off
+connect_timeout_ms = 5000               # must be more than 0
+
+[grpc.clients.billing.tls]              # https only; needs the `tls` feature
+ca_path = ""                            # necessary for https
+cert_path = ""                          # client certificate (mTLS); needs key_path
+key_path = ""
+domain_name = ""                        # empty: the endpoint host
 ```
 
 A `Toggle` (`reflection`) accepts `true`, `false`, `"auto"`, `"on"`,
@@ -174,7 +189,11 @@ Examples of environment overrides:
 ```sh
 AUTUMN_GRPC__BIND=0.0.0.0:6000
 AUTUMN_GRPC__TLS__CERT_PATH=/etc/certs/server.pem
+AUTUMN_GRPC__CLIENTS__BILLING__ENDPOINT=http://billing:50051
 ```
+
+A client env override works for each client in the files and for each
+name that the code registers.
 
 Set values in code, on top of the file values:
 
@@ -256,6 +275,141 @@ At shutdown:
 A client that stops reading a stream can keep its connection open until
 Autumn's shutdown timeout. See [ADR 0008](docs/adr/0008-shared-listener.md).
 
+## Call gRPC services
+
+With the `client` feature, a handler calls a downstream service with one
+extractor:
+
+```rust
+use autumn_plugin_grpc::{GrpcChannel, GrpcClient, GrpcResultExt};
+
+#[get("/invoice/{id}")]
+async fn invoice(
+    Path(id): Path<String>,
+    GrpcClient(mut billing): GrpcClient<BillingClient<GrpcChannel>>,
+) -> AutumnResult<Json<Invoice>> {
+    let reply = billing.get_invoice(GetInvoice { id }).await.or_http()?;
+    Ok(Json(reply.into_inner().into()))
+}
+```
+
+```rust
+GrpcPlugin::new().client("billing", BillingClient::new)
+```
+
+```toml
+[grpc.clients.billing]
+endpoint = "http://billing:50051"
+```
+
+- The client type is `<Generated>Client<GrpcChannel>`. `GrpcChannel`
+  wraps a tonic `Channel`. It adds request context, a deadline and
+  metrics to each call.
+- `GrpcClient<T>` gives the only client of type `T`. For two endpoints of
+  one type, register two names and use `GrpcClients`:
+
+  ```rust
+  async fn handler(clients: GrpcClients) -> AutumnResult<String> {
+      let mut eu = clients.get::<BillingClient<GrpcChannel>>("billing_eu")?;
+      // ...
+  }
+  ```
+
+  `AppState` also has `GrpcClients`
+  (`state.extension::<GrpcClients>()`). A client from `AppState` sends no
+  request context.
+- The clients do not need the server. They work with `enabled = false`.
+- The channel connects at the first call. A down endpoint does not stop
+  boot and does not change readiness. Its calls fail with `UNAVAILABLE`.
+
+### Request context
+
+Each call from an extractor sends:
+
+- `x-request-id`: Autumn's request ID.
+- `traceparent` and `tracestate`: the values of the incoming request.
+  They go only when `traceparent` is a valid W3C value, and
+  `tracestate` only when it has 512 bytes or less.
+- `grpc-timeout`: the smallest of the client `timeout_ms`, the time left
+  on the incoming request, and a timeout that the caller set with
+  `Request::set_timeout`.
+
+Rules:
+
+- The channel does not replace metadata that the caller sets. The trace
+  pair goes only when the caller set neither `traceparent` nor
+  `tracestate`.
+- The time left is `server.timeouts.request_timeout_ms` minus the time
+  since the extractor ran. `0` or no value: no limit from the request.
+  Autumn does not publish the request start or per-route `timeout`
+  values, so the time before the extractor is not counted (ADR 0009).
+- When no time is left, the call ends with `DEADLINE_EXCEEDED` and is not
+  sent.
+- The client trusts the incoming trace context, as Autumn does. The
+  request ID and the trace pair go to every endpoint, also to services of
+  other companies. Other headers, such as `authorization`, do not go.
+
+### Errors
+
+A bare `?` on `tonic::Status` gives a 500: Autumn converts every error
+type to 500. Use `.or_http()?` (or `status_to_error`) for this map:
+
+| gRPC code | HTTP |
+|---|---|
+| `INVALID_ARGUMENT`, `OUT_OF_RANGE`, `FAILED_PRECONDITION` | 400 |
+| `UNAUTHENTICATED` | 401 |
+| `PERMISSION_DENIED` | 403 |
+| `NOT_FOUND` | 404 |
+| `ALREADY_EXISTS`, `ABORTED` | 409 |
+| `RESOURCE_EXHAUSTED` | 429 |
+| `UNAVAILABLE` | 503 |
+| `DEADLINE_EXCEEDED` (also a client timeout) | 504 |
+| all others | 502 |
+
+- A 4xx response has a fixed text, for example `not found`. The
+  downstream message does not go to the HTTP caller.
+- A 5xx response has the code and the downstream message. Autumn shows
+  it only in `dev`.
+- The log has the full status.
+- `UNAUTHENTICATED` and `PERMISSION_DENIED` from the downstream service
+  become 401 and 403. If the app's own service credentials fail, the
+  HTTP caller also gets 401 or 403. Match on the `Status` yourself if you
+  need a different result.
+
+A failed client lookup gives a 500: no registration, the wrong type, or
+two clients of one type for `GrpcClient<T>`. Autumn shows the message
+only in `dev`.
+
+These errors stop boot:
+
+- a registered client with no endpoint and no test double,
+- a client name that two registrations use (one type, or two plugins),
+- a bad endpoint (only lowercase `http://` and `https://`),
+- `https` without the `tls` feature, or without `tls.ca_path`,
+- a TLS file that cannot be read.
+
+These log a warning at boot: a `[<section>.clients.<name>]` table with no
+registration, and one client type on two names.
+
+### Test doubles
+
+A test double is a fake service in the process. Point a client at it.
+The client uses no port:
+
+```rust
+let mut config = GrpcConfig::default();
+config.enabled = false; // this app serves no gRPC itself
+let plugin = GrpcPlugin::new()
+    .config(config)
+    .development(true)
+    .client("billing", BillingClient::new)
+    .client_double("billing", BillingServer::new(FakeBilling));
+let client = TestApp::new().routes(routes![invoice]).plugin(plugin).build();
+```
+
+The double uses the same `GrpcChannel`, so the test sees the metadata,
+the timeouts and the metrics.
+
 ## Security
 
 - The defaults limit connections, HTTP/2 streams and stream resets
@@ -272,6 +426,14 @@ Autumn's shutdown timeout. See [ADR 0008](docs/adr/0008-shared-listener.md).
   guard if you need more.
 - The health `Check` call shows if a service name exists, also when
   reflection is off. This is standard gRPC behavior.
+- Clients send the request ID and a valid `traceparent` (and a
+  `tracestate` of 512 bytes or less) of the incoming request to each
+  endpoint. They do not send other headers, such as `authorization`.
+- Client endpoints accept only lowercase `http://` and `https://`. An
+  `https` endpoint needs the `tls` feature and `tls.ca_path`. The plugin
+  never falls back to plain text.
+- The clients add no app layer. Autumn's idempotency replay does not
+  change.
 
 ## Health
 
@@ -293,8 +455,13 @@ Autumn's shutdown timeout. See [ADR 0008](docs/adr/0008-shared-listener.md).
 | `grpc_server_handling_seconds_count` | counter | `server`, `grpc_service`, `grpc_method` |
 | `grpc_server_in_flight` | gauge | `server` |
 | `grpc_server_up` | gauge | `server` |
+| `grpc_client_handled_total` | counter | `client`, `grpc_service`, `grpc_method`, `grpc_code` |
+| `grpc_client_handling_seconds_sum` | counter | `client`, `grpc_service`, `grpc_method` |
+| `grpc_client_handling_seconds_count` | counter | `client`, `grpc_service`, `grpc_method` |
+| `grpc_client_in_flight` | gauge | `client` |
 
-Clients control the request path. The plugin limits the label sets:
+Remote callers control the request path. The plugin limits the label
+sets:
 
 - It labels an unknown service `unknown`.
 - It labels a method `unknown` until the method is known. A method is
@@ -302,6 +469,11 @@ Clients control the request path. The plugin limits the label sets:
   `OK` response.
 - After `max_metric_series` label sets, it labels new service and method
   pairs `other`. The code label stays.
+
+Client labels: the `client` label is a registered name. App code sets the
+path, so service and method keep their names. A value that is not a valid
+name is `unknown`. `max_metric_series` caps the label sets of each
+client.
 
 ## Shutdown
 
@@ -333,6 +505,7 @@ shutdown hooks: call `handle.shutdown().await` yourself.
 ## Example
 
 ```sh
+cargo run --example client --features client   # a handler that calls gRPC
 cargo run --example echo
 grpcurl -plaintext localhost:50051 list
 grpcurl -plaintext -H 'authorization: Bearer demo' \
@@ -350,6 +523,7 @@ grpcurl -plaintext -H 'authorization: Bearer demo' \
 - [Architecture](docs/architecture.md)
 - [Plan and acceptance criteria](docs/plan.md)
 - [Shared listener plan](docs/plan-shared-listener.md)
+- [Client plan](docs/plan-client.md)
 - [Verification](docs/verification.md)
 - [Decisions](docs/adr/)
 

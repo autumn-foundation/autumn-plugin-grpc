@@ -42,6 +42,33 @@ pub enum GrpcError {
          release. Use `listener = \"dedicated\"`, or end TLS at a proxy"
     )]
     SharedListenerNeedsH2(&'static str),
+    /// Two registrations use one client name: with one type in one
+    /// plugin, or in two plugins.
+    #[error(
+        "gRPC client `{0}` is registered twice: two registrations of one type, or registrations in two plugins"
+    )]
+    DuplicateClient(String),
+    /// A registered client has no endpoint and no test double.
+    #[error(
+        "gRPC client `{name}` has no endpoint; set `endpoint` in `[{section}.clients.{name}]`, or add `client_double(\"{name}\", ..)`"
+    )]
+    ClientWithoutEndpoint {
+        /// The client name.
+        name: String,
+        /// The config section of the plugin.
+        section: String,
+    },
+    /// A test double names a client that is not registered.
+    #[error("gRPC client double `{0}` has no client; add `GrpcPlugin::client(\"{0}\", ..)`")]
+    DoubleWithoutClient(String),
+    /// A client channel could not be set up (for example, a TLS file).
+    #[error("cannot set up gRPC client `{name}`: {message}")]
+    ClientSetup {
+        /// The client name.
+        name: String,
+        /// The problem.
+        message: String,
+    },
     /// The startup hook ran twice.
     #[error("the gRPC server is already started")]
     AlreadyStarted,
