@@ -1,18 +1,12 @@
 //! Request context that a client call takes downstream (AC5).
 
-use std::convert::Infallible;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use autumn_web::AppState;
-use http::{HeaderMap, HeaderValue, Request};
+use http::{HeaderMap, HeaderValue};
 
 /// Longest `tracestate` that the client forwards. W3C allows 512 bytes.
 const MAX_TRACESTATE: usize = 512;
-
-/// When the plugin layer first saw the request.
-#[derive(Clone, Copy, Debug)]
-pub struct RequestStart(pub Instant);
 
 /// The values that go into the outgoing metadata.
 #[derive(Clone, Debug, Default)]
@@ -20,13 +14,13 @@ pub struct CallContext {
     pub request_id: Option<HeaderValue>,
     pub traceparent: Option<HeaderValue>,
     pub tracestate: Option<HeaderValue>,
-    /// The end of the incoming request: its start plus Autumn's
-    /// `server.timeouts.request_timeout_ms`.
+    /// The end of the incoming request: the time of extraction plus
+    /// Autumn's `server.timeouts.request_timeout_ms` (ADR 0009).
     pub deadline: Option<Instant>,
 }
 
 impl CallContext {
-    /// Read the context of an incoming request.
+    /// Read the context of an incoming request, at extraction time.
     pub fn from_request(parts: &http::request::Parts, state: &AppState) -> Self {
         let request_id = parts
             .extensions
@@ -42,12 +36,14 @@ impl CallContext {
             .and_then(|_| parts.headers.get("tracestate"))
             .filter(|value| value.len() <= MAX_TRACESTATE)
             .cloned();
-        let budget = state.config_arc().server.timeouts.request_timeout_ms;
-        let deadline = parts
-            .extensions
-            .get::<RequestStart>()
-            .zip(budget)
-            .and_then(|(start, ms)| start.0.checked_add(Duration::from_millis(ms)));
+        // Autumn turns the timeout off with `0`, as with no value.
+        let deadline = state
+            .config_arc()
+            .server
+            .timeouts
+            .request_timeout_ms
+            .filter(|ms| *ms > 0)
+            .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
         Self {
             request_id,
             traceparent,
@@ -56,18 +52,23 @@ impl CallContext {
         }
     }
 
-    /// Add the context to outgoing `headers`. A value that the caller
-    /// set stays.
+    /// Add the context to outgoing `headers`. The channel does not
+    /// replace metadata that the caller set. `traceparent` and
+    /// `tracestate` go as a pair, and only when the caller set neither.
     pub fn apply(&self, headers: &mut HeaderMap) {
-        for (name, value) in [
-            ("x-request-id", &self.request_id),
-            ("traceparent", &self.traceparent),
-            ("tracestate", &self.tracestate),
-        ] {
-            if let Some(value) = value
-                && !headers.contains_key(name)
-            {
-                headers.insert(name, value.clone());
+        if let Some(value) = &self.request_id
+            && !headers.contains_key("x-request-id")
+        {
+            headers.insert("x-request-id", value.clone());
+        }
+        let caller_trace =
+            headers.contains_key("traceparent") || headers.contains_key("tracestate");
+        if let Some(parent) = &self.traceparent
+            && !caller_trace
+        {
+            headers.insert("traceparent", parent.clone());
+            if let Some(state) = &self.tracestate {
+                headers.insert("tracestate", state.clone());
             }
         }
     }
@@ -104,45 +105,6 @@ pub fn effective_timeout(
 ) -> Option<Duration> {
     let left = deadline.map(|end| end.saturating_duration_since(now));
     [client, left, caller].into_iter().flatten().min()
-}
-
-/// Puts [`RequestStart`] into each request. It is a `static_gate`, so it
-/// runs before Autumn's request timeout starts.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RequestStartLayer;
-
-impl<S> tower::Layer<S> for RequestStartLayer {
-    type Service = RequestStartService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        RequestStartService { inner }
-    }
-}
-
-/// The service of [`RequestStartLayer`].
-#[derive(Clone, Debug)]
-pub struct RequestStartService<S> {
-    inner: S,
-}
-
-impl<S, B> tower::Service<Request<B>> for RequestStartService<S>
-where
-    S: tower::Service<Request<B>, Error = Infallible>,
-{
-    type Response = S::Response;
-    type Error = Infallible;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        request
-            .extensions_mut()
-            .insert(RequestStart(Instant::now()));
-        self.inner.call(request)
-    }
 }
 
 #[cfg(test)]
@@ -189,19 +151,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn caller_values_stay() {
-        let context = CallContext {
+    const PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    fn context() -> CallContext {
+        CallContext {
             request_id: Some(HeaderValue::from_static("autumn")),
-            traceparent: None,
+            traceparent: Some(HeaderValue::from_static(PARENT)),
             tracestate: Some(HeaderValue::from_static("a=b")),
             deadline: None,
-        };
+        }
+    }
+
+    #[test]
+    fn the_context_fills_empty_metadata() {
+        let mut headers = HeaderMap::new();
+        context().apply(&mut headers);
+        assert_eq!(headers["x-request-id"], "autumn");
+        assert_eq!(headers["traceparent"], PARENT);
+        assert_eq!(headers["tracestate"], "a=b");
+    }
+
+    #[test]
+    fn caller_values_stay_and_the_trace_pair_stays_whole() {
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", HeaderValue::from_static("mine"));
-        context.apply(&mut headers);
+        headers.insert("traceparent", HeaderValue::from_static("mine-parent"));
+        context().apply(&mut headers);
         assert_eq!(headers["x-request-id"], "mine");
-        assert_eq!(headers["tracestate"], "a=b");
+        assert_eq!(headers["traceparent"], "mine-parent");
+        assert!(
+            !headers.contains_key("tracestate"),
+            "a tracestate of another trace must not join the caller's traceparent"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("tracestate", HeaderValue::from_static("mine=1"));
+        context().apply(&mut headers);
         assert!(!headers.contains_key("traceparent"));
+        assert_eq!(headers["tracestate"], "mine=1");
     }
 }

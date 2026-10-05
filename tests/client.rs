@@ -27,13 +27,17 @@ use tonic_health::pb::health_client::HealthClient;
 
 type Echoes = EchoClient<GrpcChannel>;
 
+/// A downstream detail that must not reach the HTTP caller outside dev.
+const SERVER_SECRET: &str = "db-shard-7-password";
+
 const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
 /// A downstream service. It records the metadata of each call. The
 /// message selects the reply:
 ///
 /// - `slow`: wait 500 ms, then reply.
-/// - `code:<n>:<text>`: fail with gRPC code `n` and message `text`.
+/// - `code:<n>:<text>`: fail with gRPC code `n`. The message is `text`
+///   and [`SERVER_SECRET`], which is not in the request.
 /// - other: reply with the message.
 #[derive(Clone, Default)]
 struct Scripted {
@@ -63,7 +67,10 @@ impl Echo for Scripted {
         }
         if let Some(rest) = message.strip_prefix("code:") {
             let (code, text) = rest.split_once(':').unwrap();
-            return Err(Status::new(code.parse::<i32>().unwrap().into(), text));
+            return Err(Status::new(
+                code.parse::<i32>().unwrap().into(),
+                format!("{text} {SERVER_SECRET}"),
+            ));
         }
         Ok(Response::new(pb::SayReply { message }))
     }
@@ -276,6 +283,101 @@ async fn app_state_has_the_clients() {
     assert_eq!(clients.names(), ["echo"]);
 }
 
+async fn health_named(clients: GrpcClients) -> Result<String, AutumnError> {
+    let mut health = clients.get::<HealthClient<GrpcChannel>>("echo")?;
+    let reply = health
+        .check(tonic_health::pb::HealthCheckRequest::default())
+        .await
+        .or_http()?;
+    Ok(format!("{}", reply.into_inner().status))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_name_serves_two_client_types() {
+    let (_reporter, health) = tonic_health::server::health_reporter();
+    let plugin = plugin_with(Scripted::default())
+        .client("echo", HealthClient::new)
+        .client_double("echo", health);
+    let http = TestApp::new()
+        .profile("dev")
+        .merge(routes().route("/health-named", get(health_named)))
+        .plugin(plugin)
+        .build();
+    assert_eq!(http.get("/say/both").send().await.text(), "both");
+    let response = http.get("/health-named").send().await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.text(), "1", "SERVING");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_type_and_no_clients_are_500s() {
+    // `echo` has no `HealthClient`.
+    let http = TestApp::new()
+        .profile("dev")
+        .merge(routes().route("/health-named", get(health_named)))
+        .plugin(plugin_with(Scripted::default()))
+        .build();
+    let response = http.get("/health-named").send().await;
+    assert_eq!(response.status, 500);
+    assert!(
+        response.text().contains("cannot give"),
+        "{}",
+        response.text()
+    );
+
+    // A plugin with no clients puts no registry into `AppState`.
+    let http = boot(
+        TestApp::new().profile("dev"),
+        GrpcPlugin::new().config(no_server()).development(true),
+    );
+    let response = http.get("/say/x").send().await;
+    assert_eq!(response.status, 500);
+    assert!(
+        response.text().contains("no gRPC client is registered"),
+        "{}",
+        response.text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_plugins_share_one_registry_and_one_metrics_source() {
+    let first = GrpcPlugin::new()
+        .config(no_server())
+        .development(true)
+        .client("eu", EchoClient::new)
+        .client_double(
+            "eu",
+            EchoServer::new(EchoImpl {
+                fixed: Some("eu:".into()),
+            }),
+        );
+    let second = GrpcPlugin::new()
+        .config_section("grpc_admin")
+        .config(no_server())
+        .development(true)
+        .client("us", EchoClient::new)
+        .client_double(
+            "us",
+            EchoServer::new(EchoImpl {
+                fixed: Some("us:".into()),
+            }),
+        );
+    let http = TestApp::new()
+        .profile("dev")
+        .merge(routes())
+        .plugin(first)
+        .plugin(second)
+        .build();
+    assert_eq!(http.get("/named/eu/x").send().await.text(), "eu:x");
+    assert_eq!(http.get("/named/us/x").send().await.text(), "us:x");
+    let text = http.get("/actuator/prometheus").send().await.text();
+    for client in ["eu", "us"] {
+        let needle = format!(r#"grpc_client_in_flight{{client="{client}"}} 0"#);
+        assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+    }
+    assert_eq!(text.matches("# TYPE grpc_client_handled_total").count(), 1);
+}
+
 // ── AC4: lazy connect ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -305,6 +407,29 @@ async fn a_down_endpoint_does_not_stop_boot_or_change_readiness() {
 
     let response = http.get("/say/x").send().await;
     assert_eq!(response.status, 503, "UNAVAILABLE is 503");
+
+    // Readiness stays up, and no client part shows in health.
+    let health = http.get("/actuator/health").send().await;
+    assert_eq!(health.status, 200, "{}", health.text());
+    assert!(!health.text().contains("echo"), "{}", health.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_timeout_is_unavailable_not_a_deadline() {
+    // A non-routable address: the connect times out (or the network
+    // refuses it). Both are UNAVAILABLE.
+    let mut config = no_server();
+    let mut client = ClientConfig::default();
+    client.endpoint = "http://10.255.255.1:81".into();
+    client.connect_timeout_ms = 200;
+    config.clients.insert("echo".into(), client);
+    let plugin = GrpcPlugin::new()
+        .config(config)
+        .development(true)
+        .client("echo", EchoClient::new);
+    let http = boot(TestApp::new(), plugin);
+    let response = http.get("/say/x").send().await;
+    assert_eq!(response.status, 503, "{}", response.text());
 }
 
 // ── AC5: propagation ────────────────────────────────────────────────────
@@ -331,18 +456,43 @@ async fn the_request_id_and_trace_context_go_downstream() {
 async fn a_bad_traceparent_is_not_forwarded() {
     let double = Scripted::default();
     let http = boot(TestApp::new(), plugin_with(double.clone()));
-    for bad in [
+    for (index, bad) in [
         "junk",
         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331",
-    ] {
-        http.get("/say/x")
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = http
+            .get("/say/x")
             .header("traceparent", bad)
             .header("tracestate", "vendor=value")
             .send()
             .await;
+        assert_eq!(response.status, 200, "{}", response.text());
+        assert_eq!(double.calls(), index + 1, "the call reached the double");
         let seen = double.last();
         assert_eq!(header(&seen, "traceparent"), None, "{bad}");
         assert_eq!(header(&seen, "tracestate"), None, "{bad}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tracestate_is_forwarded_up_to_512_bytes() {
+    let double = Scripted::default();
+    let http = boot(TestApp::new(), plugin_with(double.clone()));
+    for (len, forwarded) in [(512, true), (513, false)] {
+        let state = format!("v={}", "x".repeat(len - 2));
+        let response = http
+            .get("/say/x")
+            .header("traceparent", TRACEPARENT)
+            .header("tracestate", &state)
+            .send()
+            .await;
+        assert_eq!(response.status, 200, "{}", response.text());
+        let seen = double.last();
+        assert_eq!(header(&seen, "traceparent"), Some(TRACEPARENT));
+        assert_eq!(header(&seen, "tracestate").is_some(), forwarded, "{len}");
     }
 }
 
@@ -371,6 +521,22 @@ async fn grpc_timeout_is_the_time_left_when_that_is_smaller() {
     assert_eq!(http.get("/late").send().await.status, 200);
     let sent = timeout_ms(&double.last()).expect("grpc-timeout");
     assert!((1_000..=1_700).contains(&sent), "{sent}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_timeout_of_zero_is_off() {
+    // Autumn turns the request timeout off with `0`.
+    let double = Scripted::default();
+    let plugin = plugin_with(double.clone()).configure(|c| {
+        c.clients.entry("echo".into()).or_default().timeout_ms = 1_500;
+    });
+    let mut autumn = autumn_config("test");
+    autumn.server.timeouts.request_timeout_ms = Some(0);
+    let http = boot(TestApp::new().config(autumn), plugin);
+    let response = http.get("/say/x").send().await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    let sent = timeout_ms(&double.last()).expect("grpc-timeout");
+    assert!((1_000..=1_500).contains(&sent), "{sent}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -407,44 +573,49 @@ fn problem_detail(body: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn statuses_map_to_http_and_hide_details_outside_dev() {
     let cases = [
-        (3, 400),  // INVALID_ARGUMENT
-        (16, 401), // UNAUTHENTICATED
-        (7, 403),  // PERMISSION_DENIED
-        (5, 404),  // NOT_FOUND
-        (14, 503), // UNAVAILABLE
-        (4, 504),  // DEADLINE_EXCEEDED
-        (13, 502), // INTERNAL
+        (3, 400, Some("invalid argument")),
+        (16, 401, Some("unauthenticated")),
+        (7, 403, Some("permission denied")),
+        (5, 404, Some("not found")),
+        (6, 409, Some("already exists")),
+        (8, 429, Some("resource exhausted")),
+        (14, 503, None),
+        (4, 504, None),
+        (13, 502, None),
     ];
     // Prod checks the Host header.
     let mut autumn = autumn_config("prod");
     autumn.security.trusted_hosts.hosts = vec!["localhost".into()];
     let prod = boot(
         TestApp::new().config(autumn),
-        plugin_with(Scripted::default()),
+        plugin_with(Scripted::default()).development(false),
     );
     let dev = boot(
         TestApp::new().profile("dev"),
         plugin_with(Scripted::default()),
     );
-    for (code, status) in cases {
-        let path = format!("/say/code:{code}:secret-{code}");
+    for (code, status, fixed) in cases {
+        let path = format!("/say/code:{code}:x");
         let response = prod.get(&path).header("host", "localhost").send().await;
         assert_eq!(response.status, status, "code {code}: {}", response.text());
-        let detail = problem_detail(&response.text());
+        let body = response.text();
         assert!(
-            !detail.contains("secret"),
-            "prod leaks for {code}: {detail}"
+            !body.contains(SERVER_SECRET),
+            "prod leaks for {code}: {body}"
         );
+        if let Some(fixed) = fixed {
+            assert_eq!(problem_detail(&body), fixed, "code {code}");
+        }
 
         let response = dev.get(&path).send().await;
         assert_eq!(response.status, status, "code {code}");
         let detail = problem_detail(&response.text());
-        // Autumn shows 5xx details in dev. 4xx text is fixed in all profiles.
-        assert_eq!(
-            detail.contains(&format!("secret-{code}")),
-            status >= 500,
-            "dev, code {code}: {detail}"
-        );
+        match fixed {
+            // 4xx text is fixed in all profiles.
+            Some(fixed) => assert_eq!(detail, fixed, "dev, code {code}"),
+            // Autumn shows 5xx details in dev.
+            None => assert!(detail.contains(SERVER_SECRET), "dev, code {code}: {detail}"),
+        }
     }
 }
 
@@ -482,7 +653,13 @@ fn boot_error(app: TestApp, plugin: GrpcPlugin) -> String {
     .join()
     .unwrap()
     .err()
-    .and_then(|panic| panic.downcast::<String>().ok().map(|m| *m))
+    .map(|panic| match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => panic
+            .downcast::<&str>()
+            .map(|message| (*message).to_owned())
+            .unwrap_or_default(),
+    })
     .expect("boot must fail")
 }
 
@@ -515,6 +692,7 @@ fn a_duplicate_client_stops_boot() {
 fn a_double_without_a_client_stops_boot() {
     let plugin = GrpcPlugin::new()
         .config(no_server())
+        .development(true)
         .client_double("ghost", EchoServer::new(Scripted::default()));
     let message = boot_error(TestApp::new(), plugin);
     assert!(message.contains("ghost"), "{message}");
@@ -614,6 +792,53 @@ mod tls {
         server_handle.shutdown().await;
     }
 
+    /// A client plugin for `https://127.0.0.1:port` that trusts `ca`.
+    fn tls_client(port: u16, ca: String, identity: Option<&std::path::Path>) -> GrpcPlugin {
+        let mut config = no_server();
+        let mut client = ClientConfig::default();
+        client.endpoint = format!("https://127.0.0.1:{port}");
+        client.tls.ca_path = ca;
+        if let Some(dir) = identity {
+            client.tls.cert_path = path(dir, "client.pem");
+            client.tls.key_path = path(dir, "client.key");
+        }
+        client.tls.domain_name = "localhost".into();
+        config.clients.insert("echo".into(), client);
+        GrpcPlugin::new()
+            .config(config)
+            .development(true)
+            .client("echo", EchoClient::new)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_client_verifies_the_server_certificate() {
+        let dir = write_pki("server-only");
+        let other = write_pki("other-ca");
+        // Server TLS with no client CA: no client identity is needed.
+        let server = common::echo_plugin().configure({
+            let dir = dir.clone();
+            move |c| {
+                c.tls.cert_path = path(&dir, "server.pem");
+                c.tls.key_path = path(&dir, "server.key");
+            }
+        });
+        let (_server_http, server_handle) = common::boot(server);
+        let port = server_handle.local_addr().unwrap().port();
+
+        let http = boot(TestApp::new(), tls_client(port, path(&dir, "ca.pem"), None));
+        let response = http.get("/say/plain-tls").send().await;
+        assert_eq!(response.status, 200, "{}", response.text());
+
+        // A CA that did not sign the server certificate: the call fails.
+        let http = boot(
+            TestApp::new(),
+            tls_client(port, path(&other, "ca.pem"), None),
+        );
+        let response = http.get("/say/x").send().await;
+        assert_eq!(response.status, 503, "{}", response.text());
+        server_handle.shutdown().await;
+    }
+
     #[test]
     fn a_missing_ca_file_stops_boot() {
         let mut config = no_server();
@@ -623,6 +848,7 @@ mod tls {
         config.clients.insert("echo".into(), client);
         let plugin = GrpcPlugin::new()
             .config(config)
+            .development(true)
             .client("echo", EchoClient::new);
         let message = boot_error(TestApp::new(), plugin);
         assert!(message.contains("/no/such/ca.pem"), "{message}");

@@ -212,9 +212,9 @@ pub struct ClientConfig {
     /// `http://host:port` or `https://host:port`, with no path. Empty is
     /// an error at boot, unless a test double serves the client.
     pub endpoint: String,
-    /// Longest time for one call. The client sends the smaller of this
-    /// value and the time left on the incoming request as `grpc-timeout`.
-    /// `0`: off. Default: `10000`.
+    /// Longest time for one call. The client sends the smallest of this
+    /// value, the time left on the incoming request and the caller's
+    /// timeout as `grpc-timeout`. `0`: off. Default: `10000`.
     pub timeout_ms: u64,
     /// Longest time to open a connection. Must be more than `0`.
     /// Default: `5000`.
@@ -264,7 +264,8 @@ impl ClientConfig {
         Duration::from_millis(self.connect_timeout_ms)
     }
 
-    /// `true` for an `https` endpoint.
+    /// `true` for an `https` endpoint. Validation accepts only the
+    /// lowercase schemes, so this test is safe.
     #[must_use]
     pub fn is_https(&self) -> bool {
         self.endpoint.trim().starts_with("https://")
@@ -354,7 +355,9 @@ fn validate_endpoint(endpoint: &str, key: &str) -> Result<(), ConfigError> {
             "`{key}` must be a URI like \"http://host:50051\", found \"{endpoint}\""
         ))
     })?;
-    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+    // Lowercase only: `is_https` must agree with the URI parser, which
+    // accepts `HTTPS://` too.
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
         return Err(ConfigError(format!(
             "`{key}` must start with http:// or https://, found \"{endpoint}\""
         )));

@@ -22,8 +22,8 @@ No `protoc` is necessary. `tests/codegen.rs` uses `protox`.
 
 See `docs/architecture.md`. `plugin.rs` (builder, `Plugin`, route
 assembly), `config.rs`, `server.rs` (listener, `GrpcHandle`, drain),
-`lifecycle.rs`, `metrics.rs`, `registry.rs` (`GrpcServers`, the one
-metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
+`lifecycle.rs`, `metrics.rs`, `registry.rs` (`GrpcServers`, the metrics
+source for all servers; clients have their own), `gate.rs` (shared listener, ADR 0008), `health.rs`,
 `tls.rs`, `error.rs`, `timeout.rs` (`grpc-timeout`). `client/` (feature
 `client`, ADR 0009): `mod.rs` (registry, extractors, boot checks),
 `channel.rs`, `context.rs`, `status.rs`, `metrics.rs`, `memory.rs`.
@@ -48,9 +48,11 @@ metrics source), `gate.rs` (shared listener, ADR 0008), `health.rs`,
   Names must not start with `autumn_`.
 - **Clients do not need the server.** Install them before the
   `enabled` check in `Plugin::build`. No client code without the
-  `client` feature.
+  `client` feature. Add no app `layer` or `static_gate` for clients:
+  Autumn then makes idempotency replay fail closed for the whole app.
 - **Client calls keep caller values.** Add metadata only when absent.
-  `grpc-timeout` is the smallest value. A timeout is
+  The trace pair goes only when the caller set neither header.
+  `grpc-timeout` is the smallest value. `request_timeout_ms = 0` is off. A timeout is
   `DEADLINE_EXCEEDED`, never `CANCELLED`. Tests: `tests/client.rs`.
 - **Status to HTTP:** 4xx text is fixed; never put the downstream
   message in it. 5xx text can have it (Autumn hides it outside `dev`).

@@ -1,9 +1,11 @@
 # Verification
 
-This file maps each acceptance criterion (AC) in [plan.md](plan.md) and
-[plan-shared-listener.md](plan-shared-listener.md) to its evidence. Test
-names are `file::test`. All tests run in CI on Linux, macOS and Windows,
-with no features, with `tls`, with `multiplex` and with `tls,multiplex`.
+This file maps each acceptance criterion (AC) in [plan.md](plan.md),
+[plan-shared-listener.md](plan-shared-listener.md) and
+[plan-client.md](plan-client.md) to its evidence. Test names are
+`file::test`. All tests run in CI on Linux, macOS and Windows, with no
+features, with `tls`, with `multiplex`, with `tls,multiplex`, with
+`client` and with `tls,multiplex,client`.
 
 ## Acceptance criteria
 
@@ -34,7 +36,7 @@ with no features, with `tls`, with `multiplex` and with `tls,multiplex`.
 | Line coverage ≥ 85 % | CI job "Coverage": `cargo llvm-cov --features tls,multiplex --fail-under-lines 85` |
 | MSRV 1.88 | CI job "MSRV (1.88)" |
 | Cross-platform | CI test matrix: Ubuntu, macOS, Windows |
-| Docs | `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/architecture.md` (Mermaid), `docs/adr/0001`–`0008`, `examples/echo.rs` |
+| Docs | `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/architecture.md` (Mermaid), `docs/adr/0001`–`0009`, `examples/echo.rs` |
 | Generated code is fresh | `codegen::generated_code_is_fresh` (`.gitattributes` keeps LF on Windows) |
 
 ## Shared listener (issue #2)
@@ -73,6 +75,46 @@ signal.
 | API | `GrpcError::Shared(String)`; public `dedicated_only_settings`; no `listener()` setter; no `Hash` | Fixed: typed variants, `pub(crate)`, setter, `Hash` |
 | Correctness | `child_token()` per call | Fixed: `clone()` |
 | Correctness | Metrics count a call ended before its head as `CANCELLED`; gate refusals not counted | Documented (ADR 0008) |
+
+## gRPC client (issue #3)
+
+| AC | Criterion (short) | Evidence | Verdict |
+|---|---|---|---|
+| C1 | Feature `client`; no server-only cost; the server builds without it; `clients` without the feature stops boot | CI "MSRV": `cargo check` (library, no dev-dependency features) and `cargo check --features tls,multiplex,client`. `cargo tree`: `hyper-timeout` (tonic channel) only with `client`. Clippy matrix rows `client`, `tls,client`, `multiplex,client`. `config::clients_without_the_feature_stop_boot` (config error and plugin boot, state `Failed`) | Met |
+| C2 | `[grpc.clients.<name>]` keys, same layers, strict validation, env leaves | `config::client_defaults_are_safe`, `config::clients_parse_from_toml`, `config::bad_client_values_are_rejected` (bad URI, scheme, `HTTPS://`, path, query, host, `connect_timeout_ms = 0`, name, unknown key, TLS on http, cert without key and key without cert), `config::https_needs_a_ca_bundle`, `config::client_settings_use_the_same_layers` (file, profile, env, a bad env value), `plugin::tests::a_registered_client_reads_env_overrides_and_resets_the_cache`, `client::https_without_the_tls_feature_stops_boot` | Met |
+| C3 | `GrpcClient<T>`; `GrpcClients::get` for two endpoints of one type; missing registration is a 500 and a boot warning | `client::a_handler_calls_the_double_through_the_extractor`, `client::get_by_name_covers_two_endpoints_of_one_type` (also the ambiguous 500), `client::a_missing_registration_is_a_clear_500`, `client::a_wrong_type_and_no_clients_are_500s`, `client::one_name_serves_two_client_types`, `client::app_state_has_the_clients`, `client::two_plugins_share_one_registry_and_one_metrics_source`, boot errors `client::a_client_without_an_endpoint_stops_boot`, `client::a_duplicate_client_stops_boot`, `client::a_double_without_a_client_stops_boot`. Warnings: `client::tests::config_with_no_registration_is_named_with_its_section`, `client::tests::one_type_on_two_names_warns_also_across_plugins` | Met (warning text tested; log output not read) |
+| C4 | Lazy connect; a down endpoint does not stop boot or change readiness | `client::a_down_endpoint_does_not_stop_boot_or_change_readiness` (health `UP`, no client part, call 503), `client::a_connect_timeout_is_unavailable_not_a_deadline` | Met |
+| C5 | Request ID and `traceparent` downstream; `grpc-timeout` = smaller of client timeout and time left | `client::the_request_id_and_trace_context_go_downstream`, `client::a_bad_traceparent_is_not_forwarded`, `client::tracestate_is_forwarded_up_to_512_bytes`, `client::the_client_timeout_is_sent_as_grpc_timeout`, `client::grpc_timeout_is_the_time_left_when_that_is_smaller`, `client::a_request_timeout_of_zero_is_off`, `client::caller_metadata_wins_and_the_smaller_timeout_applies`, `client::a_slow_call_ends_with_deadline_exceeded_as_504`, `client::channel::tests::a_past_deadline_ends_the_call_before_it_is_sent`, `client::channel::tests::a_call_with_time_left_succeeds`, `client::channel::tests::only_a_cancel_after_the_sent_timeout_is_a_deadline`, `client::channel::tests::a_tonic_timeout_anywhere_in_the_chain_is_a_timeout`, `client::context::tests::*`, `timeout::tests::*` | Met (time left counts from extraction; see gaps) |
+| C6 | Fixed code map; no internals in prod | `client::status::tests::every_code_has_a_fixed_status` (all 17 codes), `client::status::tests::or_http_passes_ok_values_through`, `client::statuses_map_to_http_and_hide_details_outside_dev` (prod: no downstream secret anywhere in the body; 4xx fixed text in prod and dev; 5xx details only in dev) | Met |
+| C7 | `grpc_client_*` metrics; bounded labels | `client::client_calls_are_counted`, `metrics::client_labels_are_bounded` (bad method `unknown`, cap `other`), `metrics::client_metrics_can_be_turned_off`, `client::metrics::tests::*`, `client::two_plugins_share_one_registry_and_one_metrics_source` (one family) | Met |
+| C8 | In-memory test double; no port | Most `client::*` tests use `client_double` with the server off (`local_addr()` is `None`). `client::one_name_serves_two_client_types` (two doubles on one name) | Met |
+| C9 | Docs and quality gates | README "Call gRPC services", ADR 0009, `docs/plan-client.md`, `docs/architecture.md`, CHANGELOG, CLAUDE.md, `examples/client.rs`. Gates below. Coverage 95 % lines (all features) | Met |
+
+Mutation checks: each change below made its test fail: `request_timeout_ms = 0` as a zero deadline, the trace pair added one header at a time, and the scheme check from the case-insensitive URI parser. `resolve` with no client names fails the plugin env test.
+
+Manual run: `cargo run --example client --features client`. `GET /say/hello` gives `echo: hello` and an `x-request-id`. `GET /say/fail` gives 400 `invalid argument` (the downstream message stays out). `/actuator/prometheus` shows `grpc_client_*` with codes `OK` and `INVALID_ARGUMENT`.
+
+### Client review
+
+Four review agents read the change: security, correctness, tests, and API and docs.
+
+| Angle | Finding | Result |
+|---|---|---|
+| Correctness (high) | `request_timeout_ms = 0` means "off" in Autumn, but gave a zero deadline: every call failed with 504 | Fixed. `client::a_request_timeout_of_zero_is_off` |
+| Correctness | The request-start `static_gate` made Autumn's idempotency replay fail closed for the whole app | Fixed: no app layer; the time left starts at extraction. ADR 0009 |
+| Security | `HTTPS://` passed as non-https: no TLS check, and plain text without the `tls` feature | Fixed: lowercase schemes only. `config::bad_client_values_are_rejected` |
+| Security, API, tests | A caller `traceparent` got the incoming `tracestate` of another trace | Fixed: the pair goes only when the caller set neither. `client::context::tests::caller_values_stay_and_the_trace_pair_stays_whole` |
+| Correctness | A late `CANCELLED` compared with the unrounded timeout | Fixed: compare with the sent value. `client::channel::tests::only_a_cancel_after_the_sent_timeout_is_a_deadline` |
+| Correctness | The shared-type warning did not see other plugins | Fixed. `client::tests::one_type_on_two_names_warns_also_across_plugins` |
+| Correctness | Messages named `[grpc.clients.*]` for every section | Fixed: the section is in the text |
+| Security | Trace context and request ID go to every endpoint | Documented (README Security, ADR 0009). Autumn trusts incoming trace context too |
+| Security | Downstream 401 and 403 reach the HTTP caller | Documented. The issue asks for this map |
+| API | `BoxError` and `ResponseBody` public; `GrpcClients::only` public; trait not sealed; `Ambiguous` names in one string; no `#[non_exhaustive]` on variants | Fixed |
+| API | `GrpcClients::metric_families` public | Kept: same as `GrpcHandle::metric_families` |
+| API, docs | README test double bound port 50051; no `AppState` example; "caller value stays" too broad; `DuplicateClient` text; ASD-STE100 rewrites; CLAUDE.md layout; CI row `multiplex,client` | Fixed |
+| Tests | No test for: env override through the plugin, two working plugins, one name with two types, `WrongType`, `NotInstalled`, wrong CA, server-only TLS, `tracestate` limit, metrics off, connect timeout; weak leak check; loop did not check each call; missing `.development(..)` pins | Added or fixed (tests named above) |
+| Security, CLAUDE.md | The client startup hook built its own error text | Fixed: uses `startup_error` |
+| Correctness (nit) | A `poll_ready` error (closed tonic worker) is not in `grpc_client_*` metrics | Accepted: no call starts; tonic reports it |
 
 ## Manual run
 
@@ -135,3 +177,10 @@ has a fix and a test, or a reason.
   window). ADR 0008.
 - Shared mode: the AC9 warning text is unit-tested
   (`plugin::tests::shared_mode_warns_*`). No test reads the log output.
+- Shared mode adds a `static_gate` (`GrpcGate`). Autumn then makes
+  idempotency replay fail closed for the whole app. This is older than
+  issue #3 and needs an Autumn API to mark a gate transparent. Follow-up.
+- Client: the time left counts from extraction, not from the request
+  start. Autumn publishes neither the start nor per-route `timeout`
+  values (ADR 0009).
+- Client: boot warnings are unit-tested. No test reads the log output.

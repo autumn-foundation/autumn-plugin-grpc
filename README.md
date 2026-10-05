@@ -302,8 +302,9 @@ GrpcPlugin::new().client("billing", BillingClient::new)
 endpoint = "http://billing:50051"
 ```
 
-- The client type is `<Generated>Client<GrpcChannel>`. `GrpcChannel` is
-  a tonic `Channel` with propagation, deadlines and metrics.
+- The client type is `<Generated>Client<GrpcChannel>`. `GrpcChannel`
+  wraps a tonic `Channel`. It adds request context, a deadline and
+  metrics to each call.
 - `GrpcClient<T>` gives the only client of type `T`. For two endpoints of
   one type, register two names and use `GrpcClients`:
 
@@ -314,8 +315,9 @@ endpoint = "http://billing:50051"
   }
   ```
 
-  `AppState` also has `GrpcClients`. A client from `AppState` does not
-  send request context.
+  `AppState` also has `GrpcClients`
+  (`state.extension::<GrpcClients>()`). A client from `AppState` sends no
+  request context.
 - The clients do not need the server. They work with `enabled = false`.
 - The channel connects at the first call. A down endpoint does not stop
   boot and does not change readiness. Its calls fail with `UNAVAILABLE`.
@@ -325,15 +327,27 @@ endpoint = "http://billing:50051"
 Each call from an extractor sends:
 
 - `x-request-id`: Autumn's request ID.
-- `traceparent` and `tracestate`: the values of the incoming request,
-  when `traceparent` is a valid W3C value.
+- `traceparent` and `tracestate`: the values of the incoming request.
+  They go only when `traceparent` is a valid W3C value, and
+  `tracestate` only when it has 512 bytes or less.
 - `grpc-timeout`: the smallest of the client `timeout_ms`, the time left
-  on the incoming request (`server.timeouts.request_timeout_ms`), and a
-  timeout that the caller set with `Request::set_timeout`.
+  on the incoming request, and a timeout that the caller set with
+  `Request::set_timeout`.
 
-A value that the caller sets stays. When no time is left, the call ends
-with `DEADLINE_EXCEEDED` and is not sent. Autumn does not publish
-per-route `timeout` values; the client uses the global value.
+Rules:
+
+- The channel does not replace metadata that the caller sets. The trace
+  pair goes only when the caller set neither `traceparent` nor
+  `tracestate`.
+- The time left is `server.timeouts.request_timeout_ms` minus the time
+  since the extractor ran. `0` or no value: no limit from the request.
+  Autumn does not publish the request start or per-route `timeout`
+  values, so the time before the extractor is not counted (ADR 0009).
+- When no time is left, the call ends with `DEADLINE_EXCEEDED` and is not
+  sent.
+- The client trusts the incoming trace context, as Autumn does. The
+  request ID and the trace pair go to every endpoint, also to services of
+  other companies. Other headers, such as `authorization`, do not go.
 
 ### Errors
 
@@ -353,24 +367,41 @@ type to 500. Use `.or_http()?` (or `status_to_error`) for this map:
 | all others | 502 |
 
 - A 4xx response has a fixed text, for example `not found`. The
-  downstream message does not go to the HTTP client.
+  downstream message does not go to the HTTP caller.
 - A 5xx response has the code and the downstream message. Autumn shows
   it only in `dev`.
 - The log has the full status.
+- `UNAUTHENTICATED` and `PERMISSION_DENIED` from the downstream service
+  become 401 and 403. If the app's own service credentials fail, the
+  HTTP caller also gets 401 or 403. Match on the `Status` yourself if you
+  need a different result.
 
-A missing client (no registration, the wrong type, or two clients of one
-type for `GrpcClient<T>`) is a 500 with a clear message in `dev`. These
-stop boot: a registered client with no endpoint, a duplicate name, a bad
-endpoint, `https` without the `tls` feature or without `tls.ca_path`,
-and a TLS file that cannot be read. A `[grpc.clients.<name>]` table with
-no registration logs a warning.
+A failed client lookup gives a 500: no registration, the wrong type, or
+two clients of one type for `GrpcClient<T>`. Autumn shows the message
+only in `dev`.
+
+These errors stop boot:
+
+- a registered client with no endpoint and no test double,
+- a client name that two registrations use (one type, or two plugins),
+- a bad endpoint (only lowercase `http://` and `https://`),
+- `https` without the `tls` feature, or without `tls.ca_path`,
+- a TLS file that cannot be read.
+
+These log a warning at boot: a `[<section>.clients.<name>]` table with no
+registration, and one client type on two names.
 
 ### Test doubles
 
-Point a client at a tonic service in the process. No port is used:
+A test double is a fake service in the process. Point a client at it.
+The client uses no port:
 
 ```rust
+let mut config = GrpcConfig::default();
+config.enabled = false; // this app serves no gRPC itself
 let plugin = GrpcPlugin::new()
+    .config(config)
+    .development(true)
     .client("billing", BillingClient::new)
     .client_double("billing", BillingServer::new(FakeBilling));
 let client = TestApp::new().routes(routes![invoice]).plugin(plugin).build();
@@ -395,9 +426,14 @@ the timeouts and the metrics.
   guard if you need more.
 - The health `Check` call shows if a service name exists, also when
   reflection is off. This is standard gRPC behavior.
-- Clients forward the request ID and a valid `traceparent` (and
-  `tracestate` of at most 512 bytes) of the incoming request. They do not
-  forward other headers, such as `authorization`.
+- Clients send the request ID and a valid `traceparent` (and a
+  `tracestate` of 512 bytes or less) of the incoming request to each
+  endpoint. They do not send other headers, such as `authorization`.
+- Client endpoints accept only lowercase `http://` and `https://`. An
+  `https` endpoint needs the `tls` feature and `tls.ca_path`. The plugin
+  never falls back to plain text.
+- The clients add no app layer. Autumn's idempotency replay does not
+  change.
 
 ## Health
 
@@ -424,7 +460,8 @@ the timeouts and the metrics.
 | `grpc_client_handling_seconds_count` | counter | `client`, `grpc_service`, `grpc_method` |
 | `grpc_client_in_flight` | gauge | `client` |
 
-Clients control the request path. The plugin limits the label sets:
+Remote callers control the request path. The plugin limits the label
+sets:
 
 - It labels an unknown service `unknown`.
 - It labels a method `unknown` until the method is known. A method is

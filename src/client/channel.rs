@@ -98,6 +98,12 @@ fn to_status(error: tonic::transport::Error) -> Status {
     Status::from_error(Box::new(error))
 }
 
+/// `true` for a trailers-only `CANCELLED` that comes after the sent
+/// timeout: a tonic server ended the call for time.
+fn is_late_cancel(code: Option<i32>, sent: Option<Duration>, elapsed: Duration) -> bool {
+    code == Some(tonic::Code::Cancelled as i32) && sent.is_some_and(|sent| elapsed >= sent)
+}
+
 /// `true` when `error` or one of its sources is tonic's `TimeoutExpired`.
 fn is_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(error);
@@ -135,6 +141,8 @@ impl tower::Service<http::Request<Body>> for GrpcChannel {
         {
             headers.insert("grpc-timeout", value);
         }
+        // The server times out on the sent (rounded down) value.
+        let sent = timeout.map(|t| crate::timeout::parse(&crate::timeout::encode(t)).unwrap_or(t));
         let mut call = ClientCall::start(self.shared.metrics.clone(), request.uri().path());
         if timeout == Some(Duration::ZERO) {
             call.fail(tonic::Code::DeadlineExceeded);
@@ -160,9 +168,7 @@ impl tower::Service<http::Request<Body>> for GrpcChannel {
                     // tonic servers end a call that runs out of time with
                     // a trailers-only CANCELLED. After the deadline, that
                     // is DEADLINE_EXCEEDED.
-                    if code == Some(tonic::Code::Cancelled as i32)
-                        && timeout.is_some_and(|timeout| started.elapsed() >= timeout)
-                    {
+                    if is_late_cancel(code, sent, started.elapsed()) {
                         call.fail(tonic::Code::DeadlineExceeded);
                         return Err(deadline_exceeded());
                     }
@@ -268,6 +274,18 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    #[test]
+    fn only_a_cancel_after_the_sent_timeout_is_a_deadline() {
+        let cancelled = Some(tonic::Code::Cancelled as i32);
+        let ms = Duration::from_millis;
+        assert!(is_late_cancel(cancelled, Some(ms(100)), ms(100)));
+        assert!(is_late_cancel(cancelled, Some(ms(100)), ms(150)));
+        assert!(!is_late_cancel(cancelled, Some(ms(100)), ms(99)), "early");
+        assert!(!is_late_cancel(cancelled, None, ms(500)), "no timeout");
+        assert!(!is_late_cancel(Some(0), Some(ms(100)), ms(500)), "OK");
+        assert!(!is_late_cancel(None, Some(ms(100)), ms(500)), "body status");
     }
 
     #[test]

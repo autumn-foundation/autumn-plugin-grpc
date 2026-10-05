@@ -487,6 +487,12 @@ fn bad_client_values_are_rejected() {
     for (text, needle) in [
         ("[grpc.clients.a]\nendpoint = \"not a uri\"", "endpoint"),
         ("[grpc.clients.a]\nendpoint = \"ftp://host:1\"", "http"),
+        // The URI parser accepts any case; the TLS rules need lowercase.
+        (
+            "[grpc.clients.a]\nendpoint = \"HTTPS://host:1\"",
+            "https://",
+        ),
+        ("[grpc.clients.a]\nendpoint = \"Http://host:1\"", "http://"),
         ("[grpc.clients.a]\nendpoint = \"http://\"", "endpoint"),
         ("[grpc.clients.a]\nendpoint = \"http://h:1/v1\"", "path"),
         ("[grpc.clients.a]\nendpoint = \"http://h:1?x=1\"", "path"),
@@ -583,4 +589,27 @@ fn clients_without_the_feature_stop_boot() {
     let error = GrpcConfig::from_toml_str("[grpc.clients.a]\nendpoint = \"http://h:1\"", "grpc")
         .unwrap_err();
     assert!(error.message().contains("`client` feature"), "{error}");
+
+    // Through the plugin, the server does not start.
+    let mut config = common::local_config();
+    config
+        .clients
+        .insert("a".into(), autumn_plugin_grpc::ClientConfig::default());
+    let plugin = common::echo_plugin().config(config);
+    let handle = plugin.handle();
+    let outcome = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _guard = runtime.enter();
+            let _ = autumn_web::test::TestApp::new().plugin(plugin).build();
+        }))
+    })
+    .join()
+    .unwrap();
+    let message = outcome
+        .err()
+        .and_then(|panic| panic.downcast::<String>().ok())
+        .expect("boot must fail");
+    assert!(message.contains("`client` feature"), "{message}");
+    assert_eq!(handle.state(), autumn_plugin_grpc::Lifecycle::Failed);
 }

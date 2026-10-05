@@ -353,3 +353,37 @@ async fn client_labels_are_bounded() {
         Some(0.0)
     );
 }
+
+/// `metrics = false` also turns off the client counters.
+#[cfg(feature = "client")]
+#[tokio::test(flavor = "multi_thread")]
+async fn client_metrics_can_be_turned_off() {
+    let mut config = common::local_config();
+    config.enabled = false;
+    config.metrics = false;
+    let plugin = autumn_plugin_grpc::GrpcPlugin::new()
+        .config(config)
+        .development(true)
+        .client("echo", common::EchoClient::new)
+        .client_double("echo", common::EchoServer::new(common::EchoImpl::default()));
+    let route = axum::routing::get(|clients: autumn_plugin_grpc::GrpcClients| async move {
+        let mut echo = clients
+            .get::<common::EchoClient<autumn_plugin_grpc::GrpcChannel>>("echo")
+            .unwrap();
+        echo.say(pb::SayRequest::default()).await.unwrap();
+    });
+    let http = autumn_web::test::TestApp::new()
+        .merge(axum::Router::new().route("/call", route))
+        .plugin(plugin)
+        .build();
+    assert_eq!(http.get("/call").send().await.status, 200);
+    let text = http.get("/actuator/prometheus").send().await.text();
+    assert!(
+        !text.contains("grpc_client_handled_total{"),
+        "no samples expected:\n{text}"
+    );
+    assert!(
+        text.contains(r#"grpc_client_in_flight{client="echo"} 0"#),
+        "{text}"
+    );
+}

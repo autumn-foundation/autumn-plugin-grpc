@@ -102,20 +102,26 @@ pub fn status_to_error(status: &Status) -> AutumnError {
 
 /// `.or_http()` on the result of a client call.
 ///
-/// A bare `?` on `tonic::Status` gives a 500: Autumn converts every error
-/// type to 500, and Rust does not let this crate add `From<Status>`. Use
+/// A bare `?` on `tonic::Status` gives a 500. Autumn converts all error
+/// types to 500. Rust does not let this crate add `From<Status>`. Use
 /// `.or_http()?` to get the code map.
 ///
 /// ```rust,ignore
 /// let reply = billing.get_invoice(request).await.or_http()?;
 /// ```
-pub trait GrpcResultExt<T> {
+pub trait GrpcResultExt<T>: sealed::Sealed {
     /// Map an error with [`status_to_error`].
     ///
     /// # Errors
     ///
     /// The mapped [`AutumnError`] when the call failed.
     fn or_http(self) -> Result<T, AutumnError>;
+}
+
+mod sealed {
+    /// Only `Result<T, Status>` has `.or_http()`.
+    pub trait Sealed {}
+    impl<T> Sealed for Result<T, tonic::Status> {}
 }
 
 impl<T> GrpcResultExt<T> for Result<T, Status> {

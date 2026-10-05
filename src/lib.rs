@@ -48,8 +48,7 @@ mod tls;
 
 #[cfg(feature = "client")]
 pub use client::{
-    BoxError, ClientError, GrpcChannel, GrpcClient, GrpcClients, GrpcResultExt, ResponseBody,
-    http_status, status_to_error,
+    ClientError, GrpcChannel, GrpcClient, GrpcClients, GrpcResultExt, http_status, status_to_error,
 };
 pub use config::{
     ClientConfig, ClientTls, ConfigError, DEFAULT_SECTION, GrpcConfig, Listener, Resolved,

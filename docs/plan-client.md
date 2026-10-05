@@ -34,9 +34,10 @@ Registration: `GrpcPlugin::new().client("billing", BillingClient::new)`.
   request metadata, sets `grpc-timeout`, applies the deadline and records
   metrics. Generated clients accept any tower service, so
   `BillingClient<GrpcChannel>` works.
-- The extractor reads the request: `RequestId`, `traceparent`,
-  `tracestate`, and the start time. A plugin layer (`static_gate`)
-  records the start time before Autumn's timeout layer.
+- The extractor reads the request: `RequestId`, `traceparent` and
+  `tracestate`. The time left starts at extraction. (A `static_gate` to
+  record the request start was the first idea. Review found that it
+  makes Autumn's idempotency replay fail closed for the whole app.)
 - `GrpcClients` is in `AppState`, and it is also an extractor. The
   extractor form carries the request context, so
   `clients.get::<T>("billing_eu")` propagates too.
@@ -72,6 +73,10 @@ How can this feature fail?
 | Two plugins register the same client name | Boot error |
 | `enabled = false` turns off the clients too | Clients do not depend on the server. A test proves it |
 | The in-memory double leaks a server task for each test | The server stops when the channel (and its connector) drops |
+| A plugin layer changes app behavior (found in review: idempotency replay) | No app layer. The time left starts at extraction |
+| `request_timeout_ms = 0` (Autumn: off) gives a zero deadline (found in review) | Treat `0` as no limit |
+| `HTTPS://` skips the TLS checks (found in review) | Accept only lowercase schemes |
+| A caller `traceparent` gets the incoming `tracestate` (found in review) | Send the trace pair only when the caller set neither |
 
 ## 4. Six thinking hats
 

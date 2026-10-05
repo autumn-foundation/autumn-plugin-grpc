@@ -35,14 +35,14 @@ use tonic::service::Routes;
 use tonic::transport::Endpoint;
 use tower::Service;
 
-pub use channel::{BoxError, GrpcChannel, ResponseBody};
+pub use channel::GrpcChannel;
 pub use status::{GrpcResultExt, http_status, status_to_error};
 
 use crate::config::{ClientConfig, GrpcConfig};
 use crate::error::GrpcError;
 use crate::plugin::GrpcPlugin;
 use channel::ClientShared;
-use context::{CallContext, RequestStartLayer};
+use context::CallContext;
 use metrics::ClientMetrics;
 
 /// The name of the Autumn metrics source for all clients.
@@ -91,6 +91,7 @@ pub enum ClientError {
     #[error("no gRPC client named `{0}` is registered; add `GrpcPlugin::client(\"{0}\", ..)`")]
     NotRegistered(String),
     /// The client has no factory for this type.
+    #[non_exhaustive]
     #[error(
         "gRPC client `{name}` cannot give a `{wanted}`; add `GrpcPlugin::client(\"{name}\", ..)` for that type"
     )]
@@ -104,14 +105,16 @@ pub enum ClientError {
     #[error("no gRPC client of type `{0}` is registered; add `GrpcPlugin::client(name, ..)`")]
     NoClientOfType(&'static str),
     /// More than one client has this type.
+    #[non_exhaustive]
     #[error(
-        "gRPC clients {names} all have type `{wanted}`; use `GrpcClients::get::<T>(name)` to choose one"
+        "gRPC clients {} all have type `{wanted}`; use `GrpcClients::get::<T>(name)` to choose one",
+        names.join(", ")
     )]
     Ambiguous {
         /// The type that the caller asked for.
         wanted: &'static str,
-        /// The client names, comma separated.
-        names: String,
+        /// The client names, in order.
+        names: Vec<String>,
     },
 }
 
@@ -122,11 +125,19 @@ struct Entry {
     factories: Vec<Factory>,
 }
 
+/// Build-time claims of all plugins.
+#[derive(Default)]
+struct Claims {
+    names: BTreeSet<String>,
+    types: HashMap<TypeId, (&'static str, BTreeSet<String>)>,
+}
+
 #[derive(Default)]
 struct Registry {
     entries: RwLock<BTreeMap<String, Entry>>,
-    /// Names that a plugin claimed at build, before the channels exist.
-    reserved: Mutex<BTreeSet<String>>,
+    /// Names and types that the plugins claimed at build, before the
+    /// channels exist.
+    reserved: Mutex<Claims>,
 }
 
 /// All gRPC clients of an app.
@@ -186,12 +197,8 @@ impl GrpcClients {
             })
     }
 
-    /// The only client of type `T`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] when no client or more than one client has type `T`.
-    pub fn only<T: 'static>(&self) -> Result<T, ClientError> {
+    /// The only client of type `T` (for [`GrpcClient`]).
+    pub(crate) fn only<T: 'static>(&self) -> Result<T, ClientError> {
         let wanted = std::any::type_name::<T>();
         let names: Vec<String> = self
             .registry
@@ -210,14 +217,7 @@ impl GrpcClients {
         match names.as_slice() {
             [] => Err(ClientError::NoClientOfType(wanted)),
             [name] => self.get(name),
-            _ => Err(ClientError::Ambiguous {
-                wanted,
-                names: names
-                    .iter()
-                    .map(|name| format!("`{name}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            }),
+            _ => Err(ClientError::Ambiguous { wanted, names }),
         }
     }
 
@@ -248,19 +248,45 @@ impl GrpcClients {
         )
     }
 
-    /// Claim `names` for one plugin.
-    fn reserve(&self, names: &BTreeSet<String>) -> Result<(), GrpcError> {
-        let mut reserved = self
+    /// Claim the names and types of one plugin. Return a warning for
+    /// each type that now has more than one name, also across plugins:
+    /// `GrpcClient<T>` cannot choose then.
+    fn reserve(&self, pending: &[Pending]) -> Result<Vec<String>, GrpcError> {
+        let mut claims = self
             .registry
             .reserved
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(taken) = names.iter().find(|name| reserved.contains(*name)) {
-            return Err(GrpcError::DuplicateClient(taken.clone()));
+        if let Some(taken) = pending.iter().find(|p| claims.names.contains(&p.name)) {
+            return Err(GrpcError::DuplicateClient(taken.name.clone()));
         }
-        reserved.extend(names.iter().cloned());
-        drop(reserved);
-        Ok(())
+        let mut touched = BTreeSet::new();
+        for client in pending {
+            claims.names.insert(client.name.clone());
+            for factory in &client.factories {
+                claims
+                    .types
+                    .entry(factory.type_id)
+                    .or_insert_with(|| (factory.type_name, BTreeSet::new()))
+                    .1
+                    .insert(client.name.clone());
+                touched.insert(factory.type_id);
+            }
+        }
+        let mut warnings: Vec<String> = touched
+            .iter()
+            .filter_map(|type_id| claims.types.get(type_id))
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(type_name, names)| {
+                format!(
+                    "gRPC clients {} have one type, `{type_name}`; `GrpcClient<T>` cannot choose, use `GrpcClients::get`",
+                    names.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect();
+        drop(claims);
+        warnings.sort();
+        Ok(warnings)
     }
 
     fn insert(&self, name: String, entry: Entry) {
@@ -411,12 +437,13 @@ pub fn prepare(
     app: &AppBuilder,
     registrations: Registrations,
     config: &GrpcConfig,
+    section: &str,
 ) -> Result<Option<Prepared>, GrpcError> {
     let Registrations {
         factories,
         mut doubles,
     } = registrations;
-    for warning in warnings(&factories, config) {
+    for warning in unregistered(&factories, config, section) {
         tracing::warn!("{warning}");
     }
     if factories.is_empty() {
@@ -442,7 +469,10 @@ pub fn prepare(
         let double = doubles.remove(&name);
         let client = config.clients.get(&name).cloned().unwrap_or_default();
         if double.is_none() && client.endpoint.trim().is_empty() {
-            return Err(GrpcError::ClientWithoutEndpoint(name));
+            return Err(GrpcError::ClientWithoutEndpoint {
+                name,
+                section: section.to_owned(),
+            });
         }
         pending.push(Pending {
             name,
@@ -454,8 +484,9 @@ pub fn prepare(
     let existing = app.extension::<GrpcClients>().cloned();
     let first = existing.is_none();
     let clients = existing.unwrap_or_default();
-    let names = pending.iter().map(|p| p.name.clone()).collect();
-    clients.reserve(&names)?;
+    for warning in clients.reserve(&pending)? {
+        tracing::warn!("{warning}");
+    }
     Ok(Some(Prepared {
         clients,
         first,
@@ -465,44 +496,30 @@ pub fn prepare(
     }))
 }
 
-/// Boot warnings: config with no registration, and one type on more
-/// than one name (the extractor cannot choose).
-fn warnings(factories: &[(String, Factory)], config: &GrpcConfig) -> Vec<String> {
-    let mut warnings = Vec::new();
+/// Boot warnings for config tables with no registration.
+fn unregistered(
+    factories: &[(String, Factory)],
+    config: &GrpcConfig,
+    section: &str,
+) -> Vec<String> {
     let registered: BTreeSet<&str> = factories.iter().map(|(n, _)| n.as_str()).collect();
-    for name in config.clients.keys() {
-        if !registered.contains(name.as_str()) {
-            warnings.push(format!(
-                "`[grpc.clients.{name}]` has no registration; add `GrpcPlugin::client(\"{name}\", ..)`"
-            ));
-        }
-    }
-    let mut by_type: HashMap<TypeId, (&'static str, BTreeSet<&str>)> = HashMap::new();
-    for (name, factory) in factories {
-        by_type
-            .entry(factory.type_id)
-            .or_insert_with(|| (factory.type_name, BTreeSet::new()))
-            .1
-            .insert(name);
-    }
-    let mut shared: Vec<String> = by_type
-        .into_values()
-        .filter(|(_, names)| names.len() > 1)
-        .map(|(type_name, names)| {
+    config
+        .clients
+        .keys()
+        .filter(|name| !registered.contains(name.as_str()))
+        .map(|name| {
             format!(
-                "gRPC clients {} have one type, `{type_name}`; `GrpcClient<T>` cannot choose, use `GrpcClients::get`",
-                names.into_iter().collect::<Vec<_>>().join(", ")
+                "`[{section}.clients.{name}]` has no registration; add `GrpcPlugin::client(\"{name}\", ..)`"
             )
         })
-        .collect();
-    shared.sort();
-    warnings.extend(shared);
-    warnings
+        .collect()
 }
 
 impl Prepared {
-    /// Register the startup hook, and once per app the registry, the
-    /// metrics source and the request-start layer.
+    /// Register the startup hook, and once per app the registry and the
+    /// metrics source. No app layer: Autumn treats each `layer` and
+    /// `static_gate` as opaque, and then makes idempotency replay fail
+    /// closed for the whole app (ADR 0009).
     pub fn install(self, app: AppBuilder) -> AppBuilder {
         let Self {
             clients,
@@ -514,7 +531,6 @@ impl Prepared {
         let app = if first {
             app.with_extension(clients.clone())
                 .metrics_source(METRICS_SOURCE, Arc::new(ClientsMetrics(clients.clone())))
-                .static_gate(RequestStartLayer)
         } else {
             app
         };
@@ -528,12 +544,8 @@ impl Prepared {
             async move {
                 for client in pending.unwrap_or_default() {
                     let name = client.name.clone();
-                    let entry = connect(client, metrics, max_series).map_err(|error| {
-                        autumn_web::AutumnError::internal_server_error_msg(format!(
-                            "{}: {error}",
-                            crate::plugin::PLUGIN_NAME
-                        ))
-                    })?;
+                    let entry = connect(client, metrics, max_series)
+                        .map_err(|error| crate::plugin::startup_error(&error))?;
                     clients.insert(name, entry);
                 }
                 state.insert_extension(clients);
@@ -597,24 +609,63 @@ impl MetricsSource for ClientsMetrics {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
+    fn pending(name: &str, factories: Vec<Factory>) -> Pending {
+        Pending {
+            name: name.to_owned(),
+            config: ClientConfig::default(),
+            double: None,
+            factories,
+        }
+    }
+
     #[test]
-    fn warnings_name_unregistered_config_and_shared_types() {
+    fn config_with_no_registration_is_named_with_its_section() {
         let mut config = GrpcConfig::default();
         config
             .clients
             .insert("orphan".to_owned(), ClientConfig::default());
-        let factories = vec![
-            ("a".to_owned(), Factory::new(|_: GrpcChannel| 1_u8)),
-            ("b".to_owned(), Factory::new(|_: GrpcChannel| 2_u8)),
-            ("c".to_owned(), Factory::new(|_: GrpcChannel| "x")),
-        ];
-        let found = warnings(&factories, &config);
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found[0].contains("[grpc.clients.orphan]"));
-        assert!(found[1].contains("a, b") && found[1].contains("u8"));
-        assert!(warnings(&factories[2..], &GrpcConfig::default()).is_empty());
+        config
+            .clients
+            .insert("a".to_owned(), ClientConfig::default());
+        let factories = vec![("a".to_owned(), Factory::new(|_: GrpcChannel| 1_u8))];
+        let found = unregistered(&factories, &config, "grpc_admin");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("[grpc_admin.clients.orphan]"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn one_type_on_two_names_warns_also_across_plugins() {
+        let clients = GrpcClients::default();
+        let u8s = || Factory::new(|_: GrpcChannel| 1_u8);
+        let first = clients
+            .reserve(&[
+                pending("a", vec![u8s()]),
+                pending("c", vec![Factory::new(|_: GrpcChannel| "x")]),
+            ])
+            .unwrap();
+        assert!(first.is_empty(), "{first:?}");
+        // A second plugin adds the same type on another name.
+        let second = clients.reserve(&[pending("b", vec![u8s()])]).unwrap();
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(second[0].contains("a, b") && second[0].contains("u8"));
+        // A third plugin with the same name fails.
+        let error = clients.reserve(&[pending("a", vec![])]).unwrap_err();
+        assert!(matches!(error, GrpcError::DuplicateClient(name) if name == "a"));
+    }
+
+    #[test]
+    fn the_ambiguity_error_lists_the_names() {
+        let error = ClientError::Ambiguous {
+            wanted: "T",
+            names: vec!["a".to_owned(), "b".to_owned()],
+        };
+        assert!(error.to_string().contains("a, b"), "{error}");
     }
 }

@@ -17,7 +17,7 @@
 | `src/timeout.rs` | `grpc-timeout`: parse and encode. |
 | `src/client/mod.rs` | Feature `client`: `GrpcClients` registry and extractor, `GrpcClient<T>`, `GrpcPlugin::client*`, boot checks (ADR 0009). |
 | `src/client/channel.rs` | `GrpcChannel`: propagation, deadline and metrics around a tonic `Channel`. |
-| `src/client/context.rs` | Request context (request ID, trace headers, deadline) and the request-start gate. |
+| `src/client/context.rs` | Request context: request ID, trace headers, deadline. |
 | `src/client/status.rs` | `tonic::Status` → `AutumnError` code map, `.or_http()`. |
 | `src/client/metrics.rs` | `grpc_client_*` metrics. |
 | `src/client/memory.rs` | In-memory test doubles over `tokio::io::duplex`. |
@@ -88,15 +88,13 @@ reflection after the user layers.
 ```mermaid
 sequenceDiagram
     participant R as HTTP request
-    participant G as request-start gate
     participant H as handler
     participant X as GrpcClient extractor
     participant C as GrpcChannel
     participant S as downstream service
-    R->>G: record start time (before Autumn's timeout)
-    G->>H: Autumn middleware, then the handler
+    R->>H: Autumn middleware, then the handler
     H->>X: extract
-    X->>X: request ID, traceparent, deadline = start + request_timeout_ms
+    X->>X: request ID, traceparent, deadline = now + request_timeout_ms
     X-->>H: client over GrpcChannel (with context)
     H->>C: call
     C->>C: add metadata (caller values stay)
