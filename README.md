@@ -46,13 +46,13 @@ async fn main() {
 
 ```toml
 [dependencies]
-autumn-plugin-grpc = "0.1"
+autumn-plugin-grpc = "0.2"
 # With TLS:
-# autumn-plugin-grpc = { version = "0.1", features = ["tls"] }
+# autumn-plugin-grpc = { version = "0.2", features = ["tls"] }
 # On Autumn's HTTP port:
-# autumn-plugin-grpc = { version = "0.1", features = ["multiplex"] }
+# autumn-plugin-grpc = { version = "0.2", features = ["multiplex"] }
 # To call gRPC services from handlers:
-# autumn-plugin-grpc = { version = "0.1", features = ["client"] }
+# autumn-plugin-grpc = { version = "0.2", features = ["client"] }
 ```
 
 The crate re-exports `tonic`, `tonic_health` and `tonic_reflection`. Use

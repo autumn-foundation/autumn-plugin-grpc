@@ -79,22 +79,24 @@ async fn index() -> &'static str {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(autumn_web::routes![index])
-        .state_initializer(|state| state.insert_extension(Greeting("echo: ".to_owned())))
-        .plugin(
-            GrpcPlugin::new()
-                .add_service(pb::echo_server::EchoServer::new(EchoService))
-                .file_descriptor_set(DESCRIPTOR)
-                // Demo auth. Health and reflection are not behind it.
-                .guard_interceptor(
-                    |request: Request<()>| match request.metadata().get("authorization") {
-                        Some(token) if token == "Bearer demo" => Ok(request),
-                        _ => Err(Status::unauthenticated("send `authorization: Bearer demo`")),
-                    },
-                    "bearer token",
-                ),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .routes(autumn_web::routes![index])
+            .state_initializer(|state| state.insert_extension(Greeting("echo: ".to_owned())))
+            .plugin(
+                GrpcPlugin::new()
+                    .add_service(pb::echo_server::EchoServer::new(EchoService))
+                    .file_descriptor_set(DESCRIPTOR)
+                    // Demo auth. Health and reflection are not behind it.
+                    .guard_interceptor(
+                        |request: Request<()>| match request.metadata().get("authorization") {
+                            Some(token) if token == "Bearer demo" => Ok(request),
+                            _ => Err(Status::unauthenticated("send `authorization: Bearer demo`")),
+                        },
+                        "bearer token",
+                    ),
+            )
+            .run(),
+    )
+    .await;
 }

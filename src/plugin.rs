@@ -28,7 +28,7 @@ use crate::server::{GrpcHandle, Launch, Shared};
 pub const PLUGIN_NAME: &str = "autumn-plugin-grpc";
 
 /// The `autumn-web` series this release is tested with.
-pub const SUPPORTED_AUTUMN_WEB: &str = "0.7";
+pub const SUPPORTED_AUTUMN_WEB: &str = "0.9";
 
 /// Names of the services the plugin adds itself.
 const HEALTH_SERVICE: &str = "grpc.health.v1.Health";

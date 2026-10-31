@@ -1,6 +1,6 @@
 [package]
 name = "autumn-plugin-grpc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -25,7 +25,7 @@ client = ["tonic/channel", "dep:hyper-util"]
 
 [dependencies]
 # Core surface only. Cargo unifies features with the host app.
-autumn-web = { version = "0.8", default-features = false }
+autumn-web = { version = "0.9", default-features = false }
 axum = { version = "0.8", default-features = false }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -48,7 +48,7 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 
 [dev-dependencies]
-autumn-web = { version = "0.8", default-features = false }
+autumn-web = { version = "0.9", default-features = false }
 axum = "0.8"
 bytes = "1"
 h2 = "0.4"
