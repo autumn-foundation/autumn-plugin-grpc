@@ -73,21 +73,23 @@ async fn say(
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(autumn_web::routes![say])
-        .plugin(
-            GrpcPlugin::new()
-                .add_service(EchoServer::new(EchoService))
-                .public()
-                .client("echo", EchoClient::new)
-                // In the app's autumn.toml, `[grpc.clients.echo]` sets this.
-                .configure(|config| {
-                    let echo = config.clients.entry("echo".to_owned()).or_default();
-                    if echo.endpoint.is_empty() {
-                        "http://127.0.0.1:50051".clone_into(&mut echo.endpoint);
-                    }
-                }),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .routes(autumn_web::routes![say])
+            .plugin(
+                GrpcPlugin::new()
+                    .add_service(EchoServer::new(EchoService))
+                    .public()
+                    .client("echo", EchoClient::new)
+                    // In the app's autumn.toml, `[grpc.clients.echo]` sets this.
+                    .configure(|config| {
+                        let echo = config.clients.entry("echo".to_owned()).or_default();
+                        if echo.endpoint.is_empty() {
+                            "http://127.0.0.1:50051".clone_into(&mut echo.endpoint);
+                        }
+                    }),
+            )
+            .run(),
+    )
+    .await;
 }

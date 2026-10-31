@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.2.0 — 2026-10-31
+
+- Requires `autumn-web` 0.9 (`SUPPORTED_AUTUMN_WEB = "0.9"`).
+  0.1.x stays on 0.8.
+
+## 0.1.0 — 2026-10-05
 
 - `GrpcPlugin`: serve tonic 0.14 services on a dedicated HTTP/2 listener.
 - Health service, server reflection (v1 and v1alpha).

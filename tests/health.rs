@@ -111,6 +111,8 @@ async fn the_reporter_lets_the_app_mark_a_service_down() {
 async fn autumn_actuator_health_includes_the_grpc_indicator() {
     let mut config = autumn_web::config::AutumnConfig::default();
     config.health.detailed = true;
+    // Autumn 0.9 caches health results for 1 s. The test reads twice.
+    config.health.cache_ttl_ms = 0;
     let app = autumn_web::test::TestApp::new().config(config);
     let (http, handle) = common::boot_with(app, common::echo_plugin());
     let response = http.get("/actuator/health").send().await;
