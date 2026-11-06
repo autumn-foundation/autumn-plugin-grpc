@@ -30,6 +30,8 @@ source for all servers; clients have their own), `gate.rs` (shared listener, ADR
 
 ## Rules
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - **State changes only through `LifecycleCell::apply`.** Change the spec
   table in `tests/lifecycle.rs` first.
 - **User layers wrap user services only.** Add plugin services after the
