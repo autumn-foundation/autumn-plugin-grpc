@@ -34,7 +34,7 @@ features, with `tls`, with `multiplex`, with `tls,multiplex`, with
 | clippy pedantic + nursery, `-D warnings` | CI jobs "Clippy ()", "Clippy (tls)", "Clippy (multiplex)", "Clippy (tls,multiplex)" |
 | No `unwrap`/`expect`/`panic!` in library code | `Cargo.toml` `[lints.clippy]` + `-D warnings`. Test modules allow them explicitly |
 | Line coverage ≥ 85 % | CI job "Coverage": `cargo llvm-cov --features tls,multiplex --fail-under-lines 85` |
-| MSRV 1.88 | CI job "MSRV (1.88)" |
+| MSRV 1.97 | CI job "MSRV (1.97)" |
 | Cross-platform | CI test matrix: Ubuntu, macOS, Windows |
 | Docs | `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `docs/architecture.md` (Mermaid), `docs/adr/0001`–`0009`, `examples/echo.rs` |
 | Generated code is fresh | `codegen::generated_code_is_fresh` (`.gitattributes` keeps LF on Windows) |
