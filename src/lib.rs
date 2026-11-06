@@ -64,3 +64,8 @@ pub use server::GrpcHandle;
 pub use tonic;
 pub use tonic_health;
 pub use tonic_reflection;
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

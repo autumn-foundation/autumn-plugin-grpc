@@ -73,6 +73,11 @@ name = "client"
 path = "examples/client.rs"
 required-features = ["client"]
 
+[[example]]
+name = "readme"
+path = "examples/readme.rs"
+required-features = ["client"]
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

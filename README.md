@@ -7,23 +7,30 @@ a dedicated HTTP/2 port, or on Autumn's port (see
 [Share Autumn's port](#share-autumns-port)). Handlers can also call other
 gRPC services (see [Call gRPC services](#call-grpc-services)).
 
-```rust
-use autumn_plugin_grpc::GrpcPlugin;
-
+```rust,ignore
+// From `examples/readme.rs`.
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(autumn_web::routes![index])
-        .plugin(
-            GrpcPlugin::new()
-                .add_service(GreeterServer::new(MyGreeter))
-                .file_descriptor_set(FILE_DESCRIPTOR_SET)
-                .public(),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .routes(autumn_web::routes![index, say])
+            .state_initializer(|state| state.insert_extension(Prefix("echo: ".to_owned())))
+            .plugin(
+                GrpcPlugin::new()
+                    .add_service_with(|state| EchoServer::new(MyEcho::new(state)))
+                    .file_descriptor_set(FILE_DESCRIPTOR_SET)
+                    .public()
+                    .client("echo", EchoClient::new),
+            )
+            .run(),
+    )
+    .await;
 }
 ```
+
+[`examples/readme.rs`](examples/readme.rs) has the full code of the
+snippets in this README. `EchoServer` and `EchoClient` come from
+[`proto/echo.proto`](proto/echo.proto).
 
 ## Features
 
@@ -63,34 +70,42 @@ these re-exports, or use tonic 0.14 in your app.
 Use `tonic-prost-build` in your `build.rs`. Also write the descriptor set,
 for reflection and for exact metric labels:
 
-```rust
+```rust,no_run
 // build.rs
-let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-tonic_prost_build::configure()
-    .file_descriptor_set_path(out.join("greeter_descriptor.bin"))
-    .compile_protos(&["proto/greeter.proto"], &["proto"])?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    tonic_prost_build::configure()
+        .file_descriptor_set_path(out.join("echo_descriptor.bin"))
+        .compile_protos(&["proto/echo.proto"], &["proto"])?;
+    Ok(())
+}
 ```
 
-```rust
-pub const FILE_DESCRIPTOR_SET: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/greeter_descriptor.bin"));
-```
+Then load the set in the app:
+`tonic::include_file_descriptor_set!("echo_descriptor")`.
 
 ## Use app state
 
 Each request has `AppState` in its extensions:
 
-```rust
+```rust,ignore
+// From `examples/readme.rs`.
 async fn say(&self, request: Request<SayRequest>) -> Result<Response<SayReply>, Status> {
-    let state = request.extensions().get::<AppState>().expect("set by the plugin");
+    let Some(state) = request.extensions().get::<AppState>() else {
+        return Err(Status::internal("the plugin sets AppState"));
+    };
     // Read app data, for example `state.extension::<MyStore>()`.
+    let greeting = state.extension::<Prefix>().map(|p| p.0.clone());
+    // ...
 }
 ```
 
 To build a service from `AppState` at startup, use `add_service_with`:
 
-```rust
-GrpcPlugin::new().add_service_with(|state| GreeterServer::new(MyGreeter::new(state.clone())))
+```rust,ignore
+// From `examples/readme.rs`.
+GrpcPlugin::new()
+    .add_service_with(|state| EchoServer::new(MyEcho::new(state)))
 ```
 
 ## Guard calls
@@ -98,9 +113,10 @@ GrpcPlugin::new().add_service_with(|state| GreeterServer::new(MyGreeter::new(sta
 A guard wraps user services only. Health and reflection stay open, so
 probes and tools work.
 
-```rust
+```rust,ignore
+// From `examples/readme.rs`.
 GrpcPlugin::new()
-    .add_service(GreeterServer::new(MyGreeter))
+    .add_service(EchoServer::new(my_echo))
     .guard_interceptor(
         |request: tonic::Request<()>| match request.metadata().get("authorization") {
             Some(token) if token == "Bearer secret" => Ok(request),
@@ -197,8 +213,11 @@ name that the code registers.
 
 Set values in code, on top of the file values:
 
-```rust
-GrpcPlugin::new().bind("127.0.0.1:0").configure(|c| c.timeout_ms = 5_000)
+```rust,ignore
+// From `examples/readme.rs`.
+GrpcPlugin::new()
+    .bind("127.0.0.1:0")
+    .configure(|c| c.timeout_ms = 5_000)
 ```
 
 If you set `[grpc.tls]` without the `tls` feature, boot stops. The plugin
@@ -208,9 +227,15 @@ does not fall back to plain text.
 
 Use a second section. The environment prefix changes with the section.
 
-```rust
-.plugin(GrpcPlugin::new().add_service(public_api).public())
-.plugin(GrpcPlugin::new().config_section("grpc_admin").add_service(admin_api).public())
+```rust,ignore
+// From `examples/readme.rs`.
+app.plugin(GrpcPlugin::new().add_service(public_api).public())
+    .plugin(
+        GrpcPlugin::new()
+            .config_section("grpc_admin")
+            .add_service(admin_api)
+            .public(),
+    )
 // The second plugin reads [grpc_admin] and AUTUMN_GRPC_ADMIN__*.
 ```
 
@@ -280,26 +305,26 @@ Autumn's shutdown timeout. See [ADR 0008](docs/adr/0008-shared-listener.md).
 With the `client` feature, a handler calls a downstream service with one
 extractor:
 
-```rust
-use autumn_plugin_grpc::{GrpcChannel, GrpcClient, GrpcResultExt};
-
-#[get("/invoice/{id}")]
-async fn invoice(
-    Path(id): Path<String>,
-    GrpcClient(mut billing): GrpcClient<BillingClient<GrpcChannel>>,
-) -> AutumnResult<Json<Invoice>> {
-    let reply = billing.get_invoice(GetInvoice { id }).await.or_http()?;
-    Ok(Json(reply.into_inner().into()))
+```rust,ignore
+// From `examples/readme.rs`.
+#[autumn_web::get("/say/{message}")]
+async fn say(
+    Path(message): Path<String>,
+    GrpcClient(mut echo): GrpcClient<EchoClient<GrpcChannel>>,
+) -> AutumnResult<String> {
+    let reply = echo.say(SayRequest { message }).await.or_http()?;
+    Ok(reply.into_inner().message)
 }
 ```
 
-```rust
-GrpcPlugin::new().client("billing", BillingClient::new)
+```rust,ignore
+// From `examples/readme.rs`.
+GrpcPlugin::new().client("echo", EchoClient::new)
 ```
 
 ```toml
-[grpc.clients.billing]
-endpoint = "http://billing:50051"
+[grpc.clients.echo]
+endpoint = "http://echo:50051"
 ```
 
 - The client type is `<Generated>Client<GrpcChannel>`. `GrpcChannel`
@@ -308,9 +333,10 @@ endpoint = "http://billing:50051"
 - `GrpcClient<T>` gives the only client of type `T`. For two endpoints of
   one type, register two names and use `GrpcClients`:
 
-  ```rust
+  ```rust,ignore
+  // From `examples/readme.rs`.
   async fn handler(clients: GrpcClients) -> AutumnResult<String> {
-      let mut eu = clients.get::<BillingClient<GrpcChannel>>("billing_eu")?;
+      let mut eu = clients.get::<EchoClient<GrpcChannel>>("echo_eu")?;
       // ...
   }
   ```
@@ -396,15 +422,19 @@ registration, and one client type on two names.
 A test double is a fake service in the process. Point a client at it.
 The client uses no port:
 
-```rust
+```rust,ignore
+// From `examples/readme.rs`.
 let mut config = GrpcConfig::default();
 config.enabled = false; // this app serves no gRPC itself
 let plugin = GrpcPlugin::new()
     .config(config)
     .development(true)
-    .client("billing", BillingClient::new)
-    .client_double("billing", BillingServer::new(FakeBilling));
-let client = TestApp::new().routes(routes![invoice]).plugin(plugin).build();
+    .client("echo", EchoClient::new)
+    .client_double("echo", EchoServer::new(FakeEcho));
+TestApp::new()
+    .routes(autumn_web::routes![say])
+    .plugin(plugin)
+    .build()
 ```
 
 The double uses the same `GrpcChannel`, so the test sees the metadata,
@@ -417,7 +447,7 @@ the timeouts and the metrics.
 - The health and reflection services decode requests of 16 KiB at most.
 - User services use the tonic decode limit (4 MiB). Set a lower limit on
   each generated server, for example
-  `GreeterServer::new(g).max_decoding_message_size(64 * 1024)`.
+  `EchoServer::new(my_echo).max_decoding_message_size(64 * 1024)`.
 - In `dev` and `test`, the listener is on loopback. The plugin logs a
   warning when reflection is on and the listener is not on loopback.
 - With `client_auth_optional = true`, clients without a certificate can
@@ -491,8 +521,9 @@ does the drain, so it completes also when Autumn stops the hook.
 To drain earlier, call `GrpcHandle::shutdown()`. Get the handle from
 `GrpcPlugin::handle()`, or from `AppState`:
 
-```rust
-let handle = state.extension::<autumn_plugin_grpc::GrpcHandle>();
+```rust,ignore
+// From `examples/readme.rs`.
+state.extension::<autumn_plugin_grpc::GrpcHandle>()
 ```
 
 ## Tests
