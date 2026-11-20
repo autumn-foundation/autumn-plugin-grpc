@@ -57,7 +57,7 @@ mod tests {
     fn values_parse_as_in_the_spec() {
         for (value, expected) in [
             ("3H", Duration::from_hours(3)),
-            ("1M", Duration::from_secs(60)),
+            ("1M", Duration::from_mins(1)),
             ("42S", Duration::from_secs(42)),
             ("13m", Duration::from_millis(13)),
             ("2u", Duration::from_micros(2)),

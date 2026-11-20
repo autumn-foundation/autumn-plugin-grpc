@@ -40,7 +40,7 @@ fn defaults_are_production_safe() {
     assert_eq!(config.max_connections, 1000);
     assert_eq!(
         config.http2_keepalive_interval(),
-        Some(Duration::from_secs(60))
+        Some(Duration::from_mins(1))
     );
     assert_eq!(
         config.http2_keepalive_timeout(),
@@ -87,7 +87,7 @@ fn reads_the_section_from_toml() {
         config.http2_keepalive_timeout(),
         Some(Duration::from_secs(5))
     );
-    assert_eq!(config.max_connection_age(), Some(Duration::from_secs(600)));
+    assert_eq!(config.max_connection_age(), Some(Duration::from_mins(10)));
 }
 
 #[test]

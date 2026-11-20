@@ -681,7 +681,18 @@ async fn autumn_shutdown_drains_grpc_so_the_http_drain_can_end() {
         .await
         .expect("the HTTP drain ends: the plugin ended the open stream")
         .unwrap();
-    assert_eq!(handle.state(), Lifecycle::Stopped, "no shutdown hook ran");
+    // The drain task sets `Stopped` after the last stream ends. On a busy
+    // machine the HTTP drain can end first, so wait for the state.
+    let drained = handle.clone();
+    assert!(
+        common::eventually(move || {
+            let handle = drained.clone();
+            async move { handle.state() == Lifecycle::Stopped }
+        })
+        .await,
+        "no shutdown hook ran, but the drain did not reach `Stopped`: {:?}",
+        handle.state()
+    );
     handle.shutdown().await;
 }
 
